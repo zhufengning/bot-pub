@@ -1,0 +1,15 @@
+[package]
+name = "my-kovi-bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hi = { version = "0.1.0", path = "plugins/hi" }
+kovi = "0.12.5"
+kovi-plugin-cmd = "0.3.0"
+
+[workspace]
+members = ["plugins/hi"]
+
+[workspace.dependencies]
+kovi = "0.12.5"

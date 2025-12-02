@@ -1,0 +1,8 @@
+[hi]
+enable_on_startup = true
+access_control = true
+list_mode = "WhiteList"
+
+[hi.access_list]
+friends = []
+groups = []

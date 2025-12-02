@@ -1,0 +1,17 @@
+max_messages_per_group = 20
+idle_seconds = 120
+idle_prob_initial = 0.1
+idle_prob_max = 0.9
+idle_prob_full_hits = 20
+idle_prob_growth_power = 3.0
+
+[dify]
+base_url = "https://api.dify.ai/"
+api_key = "app-114514"
+timeout_seconds = 300
+
+[vision]
+base_url = "https://api.siliconflow.cn/"
+api_key = "sk-1919810"
+model = "Qwen/Qwen3-VL-32B-Thinking"
+system_prompt = "用户是盲人，你需要为他详细描述下面的图片，直接输出图片描述，不要添加解释。"
