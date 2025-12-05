@@ -22,6 +22,246 @@ use crate::my_structs::{MyMsg, MyMsgContent, MyMsgList, SenderInfo};
 pub mod config;
 pub mod my_structs;
 
+#[derive(Clone)]
+struct AppContext {
+    msg_list: Arc<Mutex<HashMap<i64, Arc<Mutex<MyMsgList>>>>>,
+    last_seen: Arc<Mutex<HashMap<i64, Instant>>>,
+    watching: Arc<Mutex<HashSet<i64>>>,
+    config: config::Config,
+    data_path: PathBuf,
+    img_path: PathBuf,
+    runtime_bot: Arc<kovi::RuntimeBot>,
+    self_id: Option<i64>,
+}
+
+impl AppContext {
+    async fn spawn_idle_watcher(&self, group_id: i64, group_list_arc: Arc<Mutex<MyMsgList>>) {
+        {
+            let mut watching = self.watching.lock().await;
+            if watching.contains(&group_id) {
+                return;
+            }
+            watching.insert(group_id);
+        }
+
+        let ctx = self.clone();
+        kovi::spawn(async move {
+            let idle = Duration::from_secs(ctx.config.idle_seconds);
+            let mut idle_hits: u32 = 0;
+
+            loop {
+                kovi::tokio::time::sleep(Duration::from_secs(1)).await;
+
+                let last_opt = {
+                    let last_seen = ctx.last_seen.lock().await;
+                    last_seen.get(&group_id).cloned()
+                };
+
+                let Some(last) = last_opt else {
+                    break;
+                };
+
+                if last.elapsed() < idle {
+                    continue;
+                }
+
+                idle_hits = idle_hits.saturating_add(1);
+                let p = calc_idle_trigger_prob(idle_hits, &ctx.config);
+                let roll: f64 = rand::random();
+                info!(
+                    "idle watcher: group {} idle_hits={} prob={} roll={}",
+                    group_id, idle_hits, p, roll
+                );
+
+                if roll < p {
+                    clear_send_and_reply(
+                        &ctx.runtime_bot,
+                        group_list_arc.clone(),
+                        group_id,
+                        &ctx.data_path,
+                        &ctx.img_path,
+                        &ctx.config,
+                        None,
+                    )
+                    .await;
+
+                    break;
+                } else {
+                    {
+                        let mut last_seen = ctx.last_seen.lock().await;
+                        last_seen.insert(group_id, Instant::now());
+                    }
+                }
+            }
+
+            let mut watching = ctx.watching.lock().await;
+            watching.remove(&group_id);
+        });
+    }
+
+    async fn handle_group_msg(
+        &self,
+        group_id: i64,
+        receive_time: i64,
+        sender: SenderInfo,
+        msg_id: i32,
+        msg: Message,
+    ) {
+        let mut mentioned_me = false;
+        if self.self_id.is_none() {
+            warn!("self_id not set, ignoring message");
+            return;
+        }
+        let self_id_val = self.self_id.unwrap();
+
+        {
+            let mut last_seen = self.last_seen.lock().await;
+            last_seen.insert(group_id, Instant::now());
+        }
+
+        let group_list_arc = {
+            let mut group_map = self.msg_list.lock().await;
+            group_map
+                .entry(group_id)
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(MyMsgList {
+                        messages: Vec::<MyMsg>::new(),
+                        conversation_id: None,
+                    }))
+                })
+                .clone()
+        };
+
+        self.spawn_idle_watcher(group_id, group_list_arc.clone())
+            .await;
+
+        let mut msg_list = group_list_arc.lock().await;
+
+        for v in msg.iter() {
+            match v.type_.as_str() {
+                "text" => {
+                    let text_content = v.data["text"].as_str().unwrap_or_default().to_string();
+                    let content = MyMsgContent::Text(text_content);
+                    msg_list.messages.push(MyMsg {
+                        group_id,
+                        time: receive_time,
+                        sender: sender.clone(),
+                        content,
+                        msg_id,
+                    });
+                    enforce_limit(&mut msg_list, self.config.max_messages_per_group);
+                }
+                "image" => {
+                    let img_url = v.data["url"].as_str().unwrap_or_default();
+                    if img_url.is_empty() {
+                        warn!("image segment without url");
+                        continue;
+                    }
+                    if let Some(rel_path) = download_to_hashed_file(&self.img_path, img_url).await {
+                        msg_list.messages.push(MyMsg {
+                            group_id,
+                            time: receive_time,
+                            sender: sender.clone(),
+                            content: MyMsgContent::Img(rel_path),
+                            msg_id,
+                        });
+                        enforce_limit(&mut msg_list, self.config.max_messages_per_group);
+                    }
+                }
+                "at" => {
+                    let qq = v.data["qq"].as_str().unwrap_or_default();
+                    if qq == self_id_val.to_string() {
+                        mentioned_me = true;
+                        debug!(
+                            "detected @mention to self in group {} message_id {}",
+                            group_id, msg_id
+                        );
+                    }
+                    let hint_text = if mentioned_me {
+                        "<at target=\"self\" />".to_string()
+                    } else {
+                        format!("<at target=\"{}\" />", qq)
+                    };
+                    msg_list.messages.push(MyMsg {
+                        group_id,
+                        time: receive_time,
+                        sender: sender.clone(),
+                        content: MyMsgContent::Text(hint_text),
+                        msg_id,
+                    });
+                    enforce_limit(&mut msg_list, self.config.max_messages_per_group);
+                }
+                "reply" => {
+                    let raw_id = &v.data["id"];
+                    let reply_msg_id_opt = raw_id
+                        .as_i64()
+                        .map(|v| v as i32)
+                        .or_else(|| raw_id.as_str().and_then(|s| s.parse::<i32>().ok()));
+
+                    if let Some(reply_msg_id) = reply_msg_id_opt {
+                        if let Some(orig_text) =
+                            fetch_reply_content(&self.runtime_bot, reply_msg_id).await
+                        {
+                            let quoted = format!(
+                                "<reply_to msg_id={}>\n{}\n</reply_to>",
+                                reply_msg_id, orig_text
+                            );
+                            msg_list.messages.push(MyMsg {
+                                group_id,
+                                time: receive_time,
+                                sender: sender.clone(),
+                                content: MyMsgContent::Text(quoted),
+                                msg_id,
+                            });
+                            enforce_limit(&mut msg_list, self.config.max_messages_per_group);
+                        }
+                    } else {
+                        warn!("reply segment without valid id: {:?}", raw_id);
+                        continue;
+                    }
+                }
+                _ => {
+                    msg_list.messages.push(MyMsg {
+                        group_id,
+                        time: receive_time,
+                        sender: sender.clone(),
+                        content: MyMsgContent::Text("".to_string()),
+                        msg_id,
+                    });
+                    enforce_limit(&mut msg_list, self.config.max_messages_per_group);
+                }
+            }
+        }
+
+        let history_path = self.data_path.join(format!("{}.json", group_id));
+        if let Ok(buf) = serde_json::to_vec_pretty(&*msg_list) {
+            if let Err(e) = fs::write(&history_path, buf).await {
+                warn!("failed to write history for group {}: {}", group_id, e);
+            }
+        } else {
+            warn!("failed to serialize history for group {}", group_id);
+        }
+
+        if mentioned_me {
+            debug!("mentioned me, clear and reply");
+            let ctx = self.clone();
+            let group_list_arc_cloned = group_list_arc.clone();
+            kovi::spawn(async move {
+                clear_send_and_reply(
+                    &ctx.runtime_bot,
+                    group_list_arc_cloned,
+                    group_id,
+                    &ctx.data_path,
+                    &ctx.img_path,
+                    &ctx.config,
+                    Some(msg_id),
+                )
+                .await;
+            });
+        }
+    }
+}
+
 fn enforce_limit(list: &mut MyMsgList, max: usize) {
     if max == 0 {
         return;
@@ -60,78 +300,79 @@ fn calc_idle_trigger_prob(hit: u32, cfg: &config::Config) -> f64 {
 async fn load_history(data_path: &PathBuf) -> HashMap<i64, MyMsgList> {
     let mut group_map: HashMap<i64, MyMsgList> = HashMap::new();
 
-    match fs::read_dir(&data_path).await {
-        Ok(mut dir) => {
-            while let Ok(Some(entry)) = dir.next_entry().await {
-                let path = entry.path();
+    let mut dir = match fs::read_dir(&data_path).await {
+        Ok(dir) => dir,
+        Err(e) => {
+            warn!("failed to read history dir {:?}: {}", data_path, e);
+            return group_map;
+        }
+    };
 
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let path = entry.path();
+
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+
+        let buf = match fs::read(&path).await {
+            Ok(buf) => buf,
+            Err(e) => {
+                warn!("failed to read history file {:?}: {}", path, e);
+                continue;
+            }
+        };
+
+        // Try new format first
+        let parsed_new = serde_json::from_slice::<MyMsgList>(&buf);
+        if let Ok(mut list) = parsed_new {
+            // Merge into map by group_id in messages
+            let mut pushed_any = false;
+            for msg in list.messages.drain(..) {
+                let entry = group_map.entry(msg.group_id).or_insert_with(|| MyMsgList {
+                    messages: Vec::<MyMsg>::new(),
+                    conversation_id: None,
+                });
+                // prefer keeping existing conversation_id if already set
+                if entry.conversation_id.is_none() {
+                    entry.conversation_id = list.conversation_id.clone();
                 }
-
-                match fs::read(&path).await {
-                    Ok(buf) => {
-                        // Try new format first
-                        let parsed_new = serde_json::from_slice::<MyMsgList>(&buf);
-                        if let Ok(mut list) = parsed_new {
-                            // Merge into map by group_id in messages
-                            let mut pushed_any = false;
-                            for msg in list.messages.drain(..) {
-                                let entry =
-                                    group_map.entry(msg.group_id).or_insert_with(|| MyMsgList {
-                                        messages: Vec::<MyMsg>::new(),
-                                        conversation_id: None,
-                                    });
-                                // prefer keeping existing conversation_id if already set
-                                if entry.conversation_id.is_none() {
-                                    entry.conversation_id = list.conversation_id.clone();
-                                }
-                                entry.messages.push(msg);
-                                pushed_any = true;
-                            }
-                            if !pushed_any {
-                                // no messages in file, try set conversation_id by inferring group_id from file name
-                                if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                                    && let Ok(gid) = stem.parse::<i64>()
-                                {
-                                    let entry = group_map.entry(gid).or_insert_with(|| MyMsgList {
-                                        messages: Vec::<MyMsg>::new(),
-                                        conversation_id: None,
-                                    });
-                                    if entry.conversation_id.is_none() {
-                                        entry.conversation_id = list.conversation_id;
-                                    }
-                                }
-                            }
-                        } else {
-                            // Backward compatibility: old format was Vec<MyMsg>
-                            match serde_json::from_slice::<Vec<MyMsg>>(&buf) {
-                                Ok(vec_old) => {
-                                    for msg in vec_old {
-                                        group_map
-                                            .entry(msg.group_id)
-                                            .or_insert_with(|| MyMsgList {
-                                                messages: Vec::<MyMsg>::new(),
-                                                conversation_id: None,
-                                            })
-                                            .messages
-                                            .push(msg);
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("failed to parse history file {:?}: {}", path, e);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("failed to read history file {:?}: {}", path, e);
+                entry.messages.push(msg);
+                pushed_any = true;
+            }
+            if !pushed_any {
+                // no messages in file, try set conversation_id by inferring group_id from file name
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    && let Ok(gid) = stem.parse::<i64>()
+                {
+                    let entry = group_map.entry(gid).or_insert_with(|| MyMsgList {
+                        messages: Vec::<MyMsg>::new(),
+                        conversation_id: None,
+                    });
+                    if entry.conversation_id.is_none() {
+                        entry.conversation_id = list.conversation_id;
                     }
                 }
             }
-        }
-        Err(e) => {
-            warn!("failed to read history dir {:?}: {}", data_path, e);
+        } else {
+            // Backward compatibility: old format was Vec<MyMsg>
+            match serde_json::from_slice::<Vec<MyMsg>>(&buf) {
+                Ok(vec_old) => {
+                    for msg in vec_old {
+                        group_map
+                            .entry(msg.group_id)
+                            .or_insert_with(|| MyMsgList {
+                                messages: Vec::<MyMsg>::new(),
+                                conversation_id: None,
+                            })
+                            .messages
+                            .push(msg);
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to parse history file {:?}: {}", path, e);
+                }
+            }
         }
     }
     group_map
@@ -309,6 +550,7 @@ async fn get_image_summary(
 
     let summary = summarize_image_via_openai(vision_cfg, img_abs_path).await;
     if let Some(ref s) = summary {
+        let s = s.trim();
         if let Err(e) = fs::write(cache_txt_path, s.as_bytes()).await {
             warn!(
                 "failed to write image summary cache {:?}: {}",
@@ -369,10 +611,7 @@ async fn package_messages(
                 out.push_str("</message>\n");
             }
             current_msg_id = Some(m.msg_id);
-            out.push_str(&format!(
-                "<message id={}>\n",
-                m.msg_id
-            ));
+            out.push_str(&format!("<message id={}>\n", m.msg_id));
         }
 
         out.push_str(&format!(
@@ -551,6 +790,34 @@ async fn clear_send_and_reply(
     }
 }
 
+async fn fetch_reply_content(bot: &kovi::RuntimeBot, reply_id: i32) -> Option<String> {
+    let ret = match bot.get_msg(reply_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("get_msg failed for reply {}: {:?}", reply_id, e);
+            return None;
+        }
+    };
+
+    let msg_val = if let Some(v) = ret.data.get("message") {
+        v
+    } else {
+        warn!("get_msg returned no message field for reply {}", reply_id);
+        return None;
+    };
+
+    match serde_json::from_value::<Message>(msg_val.clone()) {
+        Ok(orig_msg) => Some(orig_msg.to_human_string()),
+        Err(e) => {
+            warn!(
+                "failed to parse get_msg message for reply {}: {}",
+                reply_id, e
+            );
+            None
+        }
+    }
+}
+
 #[kovi::plugin]
 async fn main() {
     let bot = plugin::get_runtime_bot();
@@ -582,20 +849,23 @@ async fn main() {
         initial_group_map.insert(gid, Arc::new(Mutex::new(list)));
     }
 
-    let msg_list_arc = Arc::new(Mutex::new(initial_group_map));
-    let last_seen_arc: Arc<Mutex<HashMap<i64, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
-    let watching_arc: Arc<Mutex<HashSet<i64>>> = Arc::new(Mutex::new(HashSet::new()));
+    let msg_list = Arc::new(Mutex::new(initial_group_map));
+    let last_seen = Arc::new(Mutex::new(HashMap::new()));
+    let watching = Arc::new(Mutex::new(HashSet::new()));
+
+    let ctx = AppContext {
+        msg_list,
+        last_seen,
+        watching,
+        config,
+        data_path,
+        img_path,
+        runtime_bot,
+        self_id,
+    };
 
     plugin::on_group_msg(move |event| {
-        // info!("received group msg: {:#?}", event);
-        let msg_list_arc = msg_list_arc.clone();
-        let img_path = img_path.clone();
-        let data_path = data_path.clone();
-        let config = config.clone();
-        let last_seen_arc = last_seen_arc.clone();
-        let watching_arc = watching_arc.clone();
-        let runtime_bot = runtime_bot.clone();
-        let self_id = self_id;
+        let ctx = ctx.clone();
         async move {
             let kovi::event::PostType::Message = &event.post_type else {
                 return;
@@ -610,259 +880,10 @@ async fn main() {
             let receive_time = event.time;
             let sender = SenderInfo::from(&event.sender);
             let msg_id = event.message_id;
+            let msg = event.message.clone();
 
-            let msg = &event.message;
-
-            let mut mentioned_me = false;
-            let self_id_val = self_id.unwrap();
-
-            {
-                let mut last_seen = last_seen_arc.lock().await;
-                last_seen.insert(group_id, Instant::now());
-            }
-
-            let group_list_arc = {
-                let mut group_map = msg_list_arc.lock().await;
-                group_map
-                    .entry(group_id)
-                    .or_insert_with(|| {
-                        Arc::new(Mutex::new(MyMsgList {
-                            messages: Vec::<MyMsg>::new(),
-                            conversation_id: None,
-                        }))
-                    })
-                    .clone()
-            };
-
-            {
-                let mut watching = watching_arc.lock().await;
-                if !watching.contains(&group_id) {
-                    watching.insert(group_id);
-                    let group_list_arc_cloned = group_list_arc.clone();
-                    let last_seen_cloned = last_seen_arc.clone();
-                    let watching_cloned = watching_arc.clone();
-                    let config_cloned = config.clone();
-                    let data_path_cloned = data_path.clone();
-                    let img_path_cloned = img_path.clone();
-                    let bot_for_send = runtime_bot.clone();
-
-                    kovi::spawn(async move {
-                        let idle = Duration::from_secs(config_cloned.idle_seconds);
-                        let mut idle_hits: u32 = 0;
-
-                        loop {
-                            kovi::tokio::time::sleep(Duration::from_secs(1)).await;
-
-                            let last_opt = {
-                                let last_seen = last_seen_cloned.lock().await;
-                                last_seen.get(&group_id).cloned()
-                            };
-
-                            let Some(last) = last_opt else {
-                                break;
-                            };
-
-                            if last.elapsed() < idle {
-                                idle_hits = 0;
-                                continue;
-                            }
-                            
-
-                            idle_hits = idle_hits.saturating_add(1);
-                            let p = calc_idle_trigger_prob(idle_hits, &config_cloned);
-                            let roll: f64 = rand::random();
-                            info!(
-                                "idle watcher: group {} idle_hits={} prob={} roll={}",
-                                group_id, idle_hits, p, roll
-                            );
-
-                            if roll < p {
-                                clear_send_and_reply(
-                                    &bot_for_send,
-                                    group_list_arc_cloned.clone(),
-                                    group_id,
-                                    &data_path_cloned,
-                                    &img_path_cloned,
-                                    &config_cloned,
-                                    None,
-                                )
-                                .await;
-
-                                break;
-                            } else {
-                                // 未命中本次触发概率，相当于重新开始一个新的 idle 窗口
-                                {
-                                    let mut last_seen = last_seen_cloned.lock().await;
-                                    last_seen.insert(group_id, Instant::now());
-                                }
-                                //idle_hits = 0;
-                            }
-                        }
-
-                        let mut watching = watching_cloned.lock().await;
-                        watching.remove(&group_id);
-                    });
-                }
-            }
-
-            let mut msg_list = group_list_arc.lock().await;
-
-            for v in msg.iter() {
-                match v.type_.as_str() {
-                    "text" => {
-                        let content = MyMsgContent::Text(
-                            v.data["text"].as_str().unwrap_or_default().to_string(),
-                        );
-                        msg_list.messages.push(MyMsg {
-                            group_id,
-                            time: receive_time,
-                            sender: sender.clone(),
-                            content,
-                            msg_id,
-                        });
-                        enforce_limit(&mut msg_list, config.max_messages_per_group);
-                    }
-                    "image" => {
-                        let img_url = v.data["url"].as_str().unwrap_or_default();
-                        if img_url.is_empty() {
-                            warn!("image segment without url");
-                            continue;
-                        }
-
-                        if let Some(rel_path) = download_to_hashed_file(&img_path, img_url).await {
-                            msg_list.messages.push(MyMsg {
-                                group_id,
-                                time: receive_time,
-                                sender: sender.clone(),
-                                content: MyMsgContent::Img(rel_path),
-                                msg_id,
-                            });
-                            enforce_limit(&mut msg_list, config.max_messages_per_group);
-                        }
-                    }
-                    "at" => {
-                        let qq = v.data["qq"].as_str().unwrap_or_default();
-                        if qq == self_id_val.to_string() {
-                            mentioned_me = true;
-                            debug!(
-                                "detected @mention to self in group {} message_id {}",
-                                group_id, msg_id
-                            );
-                        }
-                        let hint_text = if mentioned_me {
-                            "<at target=\"self\" />".to_string()
-                        } else {
-                            format!("<at target=\"{}\" />", qq)
-                        };
-                        msg_list.messages.push(MyMsg {
-                            group_id,
-                            time: receive_time,
-                            sender: sender.clone(),
-                            content: MyMsgContent::Text(hint_text),
-                            msg_id,
-                        });
-                        enforce_limit(&mut msg_list, config.max_messages_per_group);
-                    }
-                    "reply" => {
-                        let raw_id = &v.data["id"];
-                        let reply_msg_id_opt = raw_id
-                            .as_i64()
-                            .map(|v| v as i32)
-                            .or_else(|| raw_id.as_str().and_then(|s| s.parse::<i32>().ok()));
-
-                        let Some(reply_msg_id) = reply_msg_id_opt else {
-                            warn!("reply segment without valid id: {:?}", raw_id);
-                            continue;
-                        };
-
-                        match runtime_bot.get_msg(reply_msg_id).await {
-                            Ok(ret) => {
-                                if let Some(msg_val) = ret.data.get("message") {
-                                    match serde_json::from_value::<Message>(msg_val.clone()) {
-                                        Ok(orig_msg) => {
-                                            let orig_text = orig_msg.to_human_string();
-                                            let quoted =
-                                                format!("<reply_to msg_id={}>\n{}\n</reply_to>", reply_msg_id, orig_text);
-                                            msg_list.messages.push(MyMsg {
-                                                group_id,
-                                                time: receive_time,
-                                                sender: sender.clone(),
-                                                content: MyMsgContent::Text(quoted),
-                                                msg_id,
-                                            });
-                                            enforce_limit(
-                                                &mut msg_list,
-                                                config.max_messages_per_group,
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "failed to parse get_msg message for reply {}: {}",
-                                                reply_msg_id, e
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    warn!(
-                                        "get_msg returned no message field for reply {}",
-                                        reply_msg_id
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!("get_msg failed for reply {}: {:?}", reply_msg_id, e);
-                            }
-                        }
-                    }
-                    _ => {
-                        msg_list.messages.push(MyMsg {
-                            group_id,
-                            time: receive_time,
-                            sender: sender.clone(),
-                            content: MyMsgContent::Text("".to_string()),
-                            msg_id,
-                        });
-                        enforce_limit(&mut msg_list, config.max_messages_per_group);
-                    }
-                }
-            }
-
-            let history_path = data_path.join(format!("{}.json", group_id));
-
-            match serde_json::to_vec_pretty(&*msg_list) {
-                Ok(buf) => {
-                    if let Err(e) = fs::write(&history_path, buf).await {
-                        warn!("failed to write history for group {}: {}", group_id, e);
-                    }
-                }
-                Err(e) => {
-                    warn!("failed to serialize history for group {}: {}", group_id, e);
-                }
-            }
-
-            // 如果本条消息包含对机器人的 @，立刻触发一次清空+调用 Dify+回复
-            if mentioned_me {
-                debug!("mentioned me, clear and reply");
-
-                let runtime_bot_cloned = runtime_bot.clone();
-                let group_list_arc_cloned = group_list_arc.clone();
-                let data_path_cloned = data_path.clone();
-                let img_path_cloned = img_path.clone();
-                let config_cloned = config.clone();
-
-                kovi::spawn(async move {
-                    clear_send_and_reply(
-                        &runtime_bot_cloned,
-                        group_list_arc_cloned,
-                        group_id,
-                        &data_path_cloned,
-                        &img_path_cloned,
-                        &config_cloned,
-                        Some(msg_id),
-                    )
-                    .await;
-                });
-            }
+            ctx.handle_group_msg(group_id, receive_time, sender, msg_id, msg)
+                .await;
         }
     });
 }
