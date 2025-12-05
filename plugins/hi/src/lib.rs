@@ -18,6 +18,7 @@ use chrono::{Local, TimeZone};
 use dify_client::{Client as DifyClient, Config as DifyConfig, request};
 
 use crate::my_structs::{MyMsg, MyMsgContent, MyMsgList, SenderInfo};
+use regex::Regex;
 
 pub mod config;
 pub mod my_structs;
@@ -53,6 +54,10 @@ impl AppContext {
                 kovi::tokio::time::sleep(Duration::from_secs(1)).await;
 
                 let last_opt = {
+                    let watching = ctx.watching.lock().await;
+                    if !watching.contains(&group_id) {
+                        break;
+                    }
                     let last_seen = ctx.last_seen.lock().await;
                     last_seen.get(&group_id).cloned()
                 };
@@ -244,6 +249,13 @@ impl AppContext {
 
         if mentioned_me {
             debug!("mentioned me, clear and reply");
+
+            // Stop the idle watcher for this group
+            {
+                let mut watching = self.watching.lock().await;
+                watching.remove(&group_id);
+            }
+
             let ctx = self.clone();
             let group_list_arc_cloned = group_list_arc.clone();
             kovi::spawn(async move {
@@ -717,7 +729,7 @@ async fn clear_send_and_reply(
 
         match client.api().chat_messages(req).await {
             Ok(resp) => {
-                let answer = resp.answer;
+                let mut answer = resp.answer;
                 let new_cid = resp.base.conversation_id.clone();
                 info!(
                     "dify: got answer (attempt {}/{}), new_cid_set={} len={}",
@@ -726,6 +738,10 @@ async fn clear_send_and_reply(
                     new_cid.is_some(),
                     answer.len()
                 );
+
+                if answer.trim().is_empty() {
+                    answer = "bot选择沉默。".to_string();
+                }
 
                 // 成功：只更新会话 ID 并持久化，保留请求期间新收到的消息
                 {
@@ -749,11 +765,56 @@ async fn clear_send_and_reply(
                     }
                 }
 
-                let mut msg: Message = answer.into();
-                if let Some(reply_id) = reply_msg_id {
-                    msg = msg.add_reply(reply_id);
+                // Split and send
+                // Regex to capture the delimiter as well
+                let re = Regex::new(r"([，。？！\n])").unwrap();
+                // split_inclusive doesn't exist in regex create straightforwardly, but we can iterate captures
+                // A simpler strategy: replace delimiters with delimiter + \0, then split by \0
+                // Or simply iterating over the text.
+                // Let's use `split` but wrapped.
+
+                // Let's implement a manual split which includes the delimiter in the previous segment
+                let mut start = 0;
+                let mut segments = Vec::new();
+                for mat in re.find_iter(&answer) {
+                    let delimiter = mat.as_str();
+                    let content = &answer[start..mat.start()];
+                    let mut s = content.to_string();
+
+                    // If delimiter is not a comma, keep it attached.
+                    if delimiter != "，" {
+                        s.push_str(delimiter);
+                    }
+
+                    if !s.trim().is_empty() {
+                        segments.push(s);
+                    }
+                    start = mat.end();
                 }
-                bot.send_group_msg(group_id, msg);
+                if start < answer.len() {
+                    let s = &answer[start..];
+                    if !s.trim().is_empty() {
+                        segments.push(s.to_string());
+                    }
+                }
+
+                // If no segments found (rare if logic above is correct, but for safety)
+                if segments.is_empty() && !answer.is_empty() {
+                    segments.push(answer);
+                }
+
+                for segment in segments {
+                    let char_count = segment.chars().count();
+                    let duration = Duration::from_secs_f64(char_count as f64 * 0.2);
+                    debug!("sending segment len={} delay={:?}", char_count, duration);
+                    kovi::tokio::time::sleep(duration).await;
+
+                    let mut msg: Message = segment.into();
+                    if let Some(reply_id) = reply_msg_id {
+                        msg = msg.add_reply(reply_id);
+                    }
+                    bot.send_group_msg(group_id, msg);
+                }
                 return;
             }
             Err(e) => {
