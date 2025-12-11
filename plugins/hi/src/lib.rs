@@ -141,7 +141,7 @@ impl AppContext {
             .await;
 
         let mut msg_list = group_list_arc.lock().await;
-
+        let mut has_unknown_seg = false;
         for v in msg.iter() {
             match v.type_.as_str() {
                 "text" => {
@@ -226,16 +226,31 @@ impl AppContext {
                     }
                 }
                 _ => {
+                    has_unknown_seg = true;
                     msg_list.messages.push(MyMsg {
                         group_id,
                         time: receive_time,
                         sender: sender.clone(),
-                        content: MyMsgContent::Text("".to_string()),
+                        content: MyMsgContent::Text(
+                            "<unknown_segment></unknown_segment>".to_string(),
+                        ),
                         msg_id,
                     });
                     enforce_limit(&mut msg_list, self.config.max_messages_per_group);
                 }
             }
+        }
+        if has_unknown_seg {
+            msg_list.messages.push(MyMsg {
+                group_id,
+                time: receive_time,
+                sender: sender.clone(),
+                content: MyMsgContent::Text(format!(
+                    "<msg_overview reason=\"has_unknown_seg\">{}</msg_overview>",
+                    msg.to_human_string()
+                )),
+                msg_id,
+            });
         }
 
         let history_path = self.data_path.join(format!("{}.json", group_id));
@@ -716,6 +731,7 @@ async fn clear_send_and_reply(
 
     let attempts = (1 + cfg.dify_retry_times as usize).max(1);
     let mut last_err: Option<String> = None;
+    let re = Regex::new(r"([，。？！]|\n+)").unwrap();
 
     for attempt in 1..=attempts {
         let mut req = request::ChatMessagesRequest {
@@ -767,22 +783,28 @@ async fn clear_send_and_reply(
 
                 // Split and send
                 // Regex to capture the delimiter as well
-                let re = Regex::new(r"([，。？！\n])").unwrap();
-                // split_inclusive doesn't exist in regex create straightforwardly, but we can iterate captures
-                // A simpler strategy: replace delimiters with delimiter + \0, then split by \0
-                // Or simply iterating over the text.
-                // Let's use `split` but wrapped.
+                // Treat newlines as explicit separators regardless of limit
+                // Also merge continuous newlines
 
-                // Let's implement a manual split which includes the delimiter in the previous segment
+                let answer_trimmed = answer.trim_matches(|c: char| c == '\r' || c == '\n');
                 let mut start = 0;
                 let mut segments = Vec::new();
-                for mat in re.find_iter(&answer) {
+                let max_segments = cfg.max_split_segments.max(1);
+
+                for mat in re.find_iter(answer_trimmed) {
                     let delimiter = mat.as_str();
-                    let content = &answer[start..mat.start()];
+                    let is_newline = delimiter.contains('\n');
+
+                    // Check limit only for soft splits (non-newlines)
+                    if !is_newline && segments.len() >= max_segments - 1 {
+                        continue;
+                    }
+
+                    let content = &answer_trimmed[start..mat.start()];
                     let mut s = content.to_string();
 
-                    // If delimiter is not a comma, keep it attached.
-                    if delimiter != "，" {
+                    // If delimiter is not a comma and not newline, keep it attached.
+                    if !is_newline && delimiter != "，" {
                         s.push_str(delimiter);
                     }
 
@@ -791,28 +813,46 @@ async fn clear_send_and_reply(
                     }
                     start = mat.end();
                 }
-                if start < answer.len() {
-                    let s = &answer[start..];
+
+                // Add the remaining part as the last segment
+                if start < answer_trimmed.len() {
+                    let s = &answer_trimmed[start..];
                     if !s.trim().is_empty() {
                         segments.push(s.to_string());
                     }
                 }
 
                 // If no segments found (rare if logic above is correct, but for safety)
-                if segments.is_empty() && !answer.is_empty() {
-                    segments.push(answer);
+                if segments.is_empty() && !answer_trimmed.is_empty() {
+                    segments.push(answer_trimmed.to_string());
                 }
 
-                for segment in segments {
+                let total_segments = segments.len();
+                for (i, segment) in segments.into_iter().enumerate() {
                     let char_count = segment.chars().count();
-                    let duration = Duration::from_secs_f64(char_count as f64 * 0.2);
-                    debug!("sending segment len={} delay={:?}", char_count, duration);
+                    let delay_per_char = if cfg.delay_per_char < 0.0 {
+                        0.0
+                    } else {
+                        cfg.delay_per_char
+                    };
+                    let duration = Duration::from_secs_f64(char_count as f64 * delay_per_char);
+
+                    debug!(
+                        "sending segment {}/{} len={} delay={:?}",
+                        i + 1,
+                        total_segments,
+                        char_count,
+                        duration
+                    );
                     kovi::tokio::time::sleep(duration).await;
 
                     let mut msg: Message = segment.into();
-                    if let Some(reply_id) = reply_msg_id {
+                    if let Some(reply_id) = reply_msg_id
+                        && i == 0
+                    {
                         msg = msg.add_reply(reply_id);
                     }
+
                     bot.send_group_msg(group_id, msg);
                 }
                 return;

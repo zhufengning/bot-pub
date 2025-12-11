@@ -14,6 +14,8 @@ pub struct Config {
     pub idle_prob_max: f64,
     pub idle_prob_full_hits: u32,
     pub idle_prob_growth_power: f64,
+    pub max_split_segments: usize,
+    pub delay_per_char: f64,
 }
 
 impl Default for Config {
@@ -28,6 +30,8 @@ impl Default for Config {
             idle_prob_max: 1.0,
             idle_prob_full_hits: 5,
             idle_prob_growth_power: 2.0,
+            max_split_segments: 5,
+            delay_per_char: 0.2,
         }
     }
 }
@@ -59,6 +63,8 @@ pub async fn load_config(data_path: &Path) -> Config {
         idle_prob_max: Option<f64>,
         idle_prob_full_hits: Option<u32>,
         idle_prob_growth_power: Option<f64>,
+        max_split_segments: Option<usize>,
+        delay_per_char: Option<f64>,
     }
 
     match toml::from_str::<RawConfig>(&s) {
@@ -72,6 +78,8 @@ pub async fn load_config(data_path: &Path) -> Config {
             idle_prob_max: raw.idle_prob_max.unwrap_or(1.0),
             idle_prob_full_hits: raw.idle_prob_full_hits.unwrap_or(5),
             idle_prob_growth_power: raw.idle_prob_growth_power.unwrap_or(2.0),
+            max_split_segments: raw.max_split_segments.unwrap_or(5),
+            delay_per_char: raw.delay_per_char.unwrap_or(0.2),
         },
         Err(e) => {
             warn!("failed to parse config.toml: {}", e);
