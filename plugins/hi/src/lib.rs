@@ -28,6 +28,8 @@ struct AppContext {
     msg_list: Arc<Mutex<HashMap<i64, Arc<Mutex<MyMsgList>>>>>,
     last_seen: Arc<Mutex<HashMap<i64, Instant>>>,
     watching: Arc<Mutex<HashSet<i64>>>,
+    // Per-group reply lock to prevent interleaved segmented replies when multiple triggers occur
+    reply_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
     config: config::Config,
     data_path: PathBuf,
     img_path: PathBuf,
@@ -36,6 +38,209 @@ struct AppContext {
 }
 
 impl AppContext {
+    // Append segments from a Kovi Message into our MyMsgList, expanding reply segments
+    // iteratively (no async recursion) so we can preserve nested images/text.
+    // - Keeps msg_id of the outer message so nested replies render inside the same <message>
+    // - Emits <reply ...> and </reply> markers as Text entries for the packager
+    // - Downloads images to hashed files and preserves them as Img entries
+    async fn append_segments_recursive(
+        &self,
+        msg_list: &mut MyMsgList,
+        group_id: i64,
+        receive_time: i64,
+        sender: &SenderInfo,
+        current_msg_id: i32,
+        msg: &Message,
+    ) -> bool {
+        enum Step {
+            OpenReply {
+                reply_msg_id: i32,
+                reply_sender: SenderInfo,
+                reply_time: Option<i64>,
+            },
+            CloseReply,
+            Process {
+                msg: Message,
+                sender: SenderInfo,
+                time: i64,
+            },
+        }
+
+        let mut has_unknown_seg = false;
+        let mut stack: Vec<Step> = Vec::new();
+        stack.push(Step::Process {
+            msg: msg.clone(),
+            sender: sender.clone(),
+            time: receive_time,
+        });
+
+        while let Some(step) = stack.pop() {
+            match step {
+                Step::OpenReply {
+                    reply_msg_id,
+                    reply_sender,
+                    reply_time,
+                } => {
+                    let sender_name = display_name(&reply_sender);
+                    let open = if let Some(t) = reply_time
+                        && let Some(dt) = Local.timestamp_opt(t, 0).single()
+                    {
+                        format!(
+                            "<reply to_msg_id={} sender_id={} sender_name=\"{}\" time=\"{}\">",
+                            reply_msg_id,
+                            reply_sender.user_id,
+                            sender_name,
+                            dt.format("%Y-%m-%d %H:%M:%S")
+                        )
+                    } else {
+                        format!(
+                            "<reply to_msg_id={} sender_id={} sender_name=\"{}\">",
+                            reply_msg_id, reply_sender.user_id, sender_name
+                        )
+                    };
+                    msg_list.messages.push(MyMsg {
+                        group_id,
+                        time: reply_time.unwrap_or(receive_time),
+                        sender: reply_sender.clone(),
+                        content: MyMsgContent::Text(open),
+                        msg_id: current_msg_id,
+                    });
+                    enforce_limit(msg_list, self.config.max_messages_per_group);
+                }
+                Step::CloseReply => {
+                    msg_list.messages.push(MyMsg {
+                        group_id,
+                        time: receive_time,
+                        sender: sender.clone(),
+                        content: MyMsgContent::Text("</reply>".to_string()),
+                        msg_id: current_msg_id,
+                    });
+                    enforce_limit(msg_list, self.config.max_messages_per_group);
+                }
+                Step::Process { msg, sender, time } => {
+                    for v in msg.iter() {
+                        match v.type_.as_str() {
+                            "text" => {
+                                let text_content =
+                                    v.data["text"].as_str().unwrap_or_default().to_string();
+                                msg_list.messages.push(MyMsg {
+                                    group_id,
+                                    time,
+                                    sender: sender.clone(),
+                                    content: MyMsgContent::Text(text_content),
+                                    msg_id: current_msg_id,
+                                });
+                                enforce_limit(msg_list, self.config.max_messages_per_group);
+                            }
+                            "image" => {
+                                let img_url = v.data["url"].as_str().unwrap_or_default();
+                                if img_url.is_empty() {
+                                    warn!("image segment without url");
+                                    continue;
+                                }
+                                if let Some(rel_path) =
+                                    download_to_hashed_file(&self.img_path, img_url).await
+                                {
+                                    msg_list.messages.push(MyMsg {
+                                        group_id,
+                                        time,
+                                        sender: sender.clone(),
+                                        content: MyMsgContent::Img(rel_path),
+                                        msg_id: current_msg_id,
+                                    });
+                                    enforce_limit(msg_list, self.config.max_messages_per_group);
+                                }
+                            }
+                            "at" => {
+                                let qq = v.data["qq"].as_str().unwrap_or_default();
+                                let hint_text = if self.self_id.is_some()
+                                    && qq == self.self_id.unwrap().to_string()
+                                {
+                                    "<at target=\"self\" />".to_string()
+                                } else {
+                                    format!("<at target=\"{}\" />", qq)
+                                };
+                                msg_list.messages.push(MyMsg {
+                                    group_id,
+                                    time,
+                                    sender: sender.clone(),
+                                    content: MyMsgContent::Text(hint_text),
+                                    msg_id: current_msg_id,
+                                });
+                                enforce_limit(msg_list, self.config.max_messages_per_group);
+                            }
+                            "reply" => {
+                                let raw_id = &v.data["id"];
+                                let reply_msg_id_opt =
+                                    raw_id.as_i64().map(|v| v as i32).or_else(|| {
+                                        raw_id.as_str().and_then(|s| s.parse::<i32>().ok())
+                                    });
+
+                                if let Some(reply_msg_id) = reply_msg_id_opt {
+                                    if let Some((reply_sender, orig_msg, orig_time)) =
+                                        fetch_reply_message(&self.runtime_bot, reply_msg_id).await
+                                    {
+                                        // push reverse order so they pop in desired sequence: Open -> Process -> Close
+                                        stack.push(Step::CloseReply);
+                                        stack.push(Step::Process {
+                                            msg: orig_msg,
+                                            sender: reply_sender.clone(),
+                                            time: orig_time.unwrap_or(time),
+                                        });
+                                        stack.push(Step::OpenReply {
+                                            reply_msg_id,
+                                            reply_sender,
+                                            reply_time: orig_time,
+                                        });
+                                    } else {
+                                        warn!("reply segment fetch failed: id={}", reply_msg_id);
+                                        has_unknown_seg = true;
+                                        msg_list.messages.push(MyMsg {
+                                            group_id,
+                                            time,
+                                            sender: sender.clone(),
+                                            content: MyMsgContent::Text(
+                                                "<unknown_segment kind=\"reply\"/>".to_string(),
+                                            ),
+                                            msg_id: current_msg_id,
+                                        });
+                                        enforce_limit(msg_list, self.config.max_messages_per_group);
+                                    }
+                                } else {
+                                    warn!("reply segment without valid id: {:?}", raw_id);
+                                    has_unknown_seg = true;
+                                    msg_list.messages.push(MyMsg {
+                                        group_id,
+                                        time,
+                                        sender: sender.clone(),
+                                        content: MyMsgContent::Text(
+                                            "<unknown_segment kind=\"reply\"/>".to_string(),
+                                        ),
+                                        msg_id: current_msg_id,
+                                    });
+                                    enforce_limit(msg_list, self.config.max_messages_per_group);
+                                }
+                            }
+                            _ => {
+                                has_unknown_seg = true;
+                                msg_list.messages.push(MyMsg {
+                                    group_id,
+                                    time,
+                                    sender: sender.clone(),
+                                    content: MyMsgContent::Text(
+                                        "<unknown_segment></unknown_segment>".to_string(),
+                                    ),
+                                    msg_id: current_msg_id,
+                                });
+                                enforce_limit(msg_list, self.config.max_messages_per_group);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        has_unknown_seg
+    }
     async fn spawn_idle_watcher(&self, group_id: i64, group_list_arc: Arc<Mutex<MyMsgList>>) {
         {
             let mut watching = self.watching.lock().await;
@@ -81,6 +286,7 @@ impl AppContext {
                 if roll < p {
                     clear_send_and_reply(
                         &ctx.runtime_bot,
+                        ctx.reply_locks.clone(),
                         group_list_arc.clone(),
                         group_id,
                         &ctx.data_path,
@@ -140,106 +346,25 @@ impl AppContext {
         self.spawn_idle_watcher(group_id, group_list_arc.clone())
             .await;
 
-        let mut msg_list = group_list_arc.lock().await;
-        let mut has_unknown_seg = false;
+        // 1) pre-scan for top-level @self only to trigger immediate reply
         for v in msg.iter() {
-            match v.type_.as_str() {
-                "text" => {
-                    let text_content = v.data["text"].as_str().unwrap_or_default().to_string();
-                    let content = MyMsgContent::Text(text_content);
-                    msg_list.messages.push(MyMsg {
-                        group_id,
-                        time: receive_time,
-                        sender: sender.clone(),
-                        content,
-                        msg_id,
-                    });
-                    enforce_limit(&mut msg_list, self.config.max_messages_per_group);
-                }
-                "image" => {
-                    let img_url = v.data["url"].as_str().unwrap_or_default();
-                    if img_url.is_empty() {
-                        warn!("image segment without url");
-                        continue;
-                    }
-                    if let Some(rel_path) = download_to_hashed_file(&self.img_path, img_url).await {
-                        msg_list.messages.push(MyMsg {
-                            group_id,
-                            time: receive_time,
-                            sender: sender.clone(),
-                            content: MyMsgContent::Img(rel_path),
-                            msg_id,
-                        });
-                        enforce_limit(&mut msg_list, self.config.max_messages_per_group);
-                    }
-                }
-                "at" => {
-                    let qq = v.data["qq"].as_str().unwrap_or_default();
-                    if qq == self_id_val.to_string() {
-                        mentioned_me = true;
-                        debug!(
-                            "detected @mention to self in group {} message_id {}",
-                            group_id, msg_id
-                        );
-                    }
-                    let hint_text = if mentioned_me {
-                        "<at target=\"self\" />".to_string()
-                    } else {
-                        format!("<at target=\"{}\" />", qq)
-                    };
-                    msg_list.messages.push(MyMsg {
-                        group_id,
-                        time: receive_time,
-                        sender: sender.clone(),
-                        content: MyMsgContent::Text(hint_text),
-                        msg_id,
-                    });
-                    enforce_limit(&mut msg_list, self.config.max_messages_per_group);
-                }
-                "reply" => {
-                    let raw_id = &v.data["id"];
-                    let reply_msg_id_opt = raw_id
-                        .as_i64()
-                        .map(|v| v as i32)
-                        .or_else(|| raw_id.as_str().and_then(|s| s.parse::<i32>().ok()));
-
-                    if let Some(reply_msg_id) = reply_msg_id_opt {
-                        if let Some(orig_text) =
-                            fetch_reply_content(&self.runtime_bot, reply_msg_id).await
-                        {
-                            let quoted = format!(
-                                "<reply_to msg_id={}>\n{}\n</reply_to>",
-                                reply_msg_id, orig_text
-                            );
-                            msg_list.messages.push(MyMsg {
-                                group_id,
-                                time: receive_time,
-                                sender: sender.clone(),
-                                content: MyMsgContent::Text(quoted),
-                                msg_id,
-                            });
-                            enforce_limit(&mut msg_list, self.config.max_messages_per_group);
-                        }
-                    } else {
-                        warn!("reply segment without valid id: {:?}", raw_id);
-                        continue;
-                    }
-                }
-                _ => {
-                    has_unknown_seg = true;
-                    msg_list.messages.push(MyMsg {
-                        group_id,
-                        time: receive_time,
-                        sender: sender.clone(),
-                        content: MyMsgContent::Text(
-                            "<unknown_segment></unknown_segment>".to_string(),
-                        ),
-                        msg_id,
-                    });
-                    enforce_limit(&mut msg_list, self.config.max_messages_per_group);
+            if v.type_ == "at" {
+                let qq = v.data["qq"].as_str().unwrap_or_default();
+                if qq == self_id_val.to_string() {
+                    mentioned_me = true;
+                    debug!(
+                        "detected @mention to self in group {} message_id {}",
+                        group_id, msg_id
+                    );
                 }
             }
         }
+
+        // 2) append segments (with recursive reply expansion) into list
+        let mut msg_list = group_list_arc.lock().await;
+        let has_unknown_seg = self
+            .append_segments_recursive(&mut msg_list, group_id, receive_time, &sender, msg_id, &msg)
+            .await;
         if has_unknown_seg {
             msg_list.messages.push(MyMsg {
                 group_id,
@@ -276,6 +401,7 @@ impl AppContext {
             kovi::spawn(async move {
                 clear_send_and_reply(
                     &ctx.runtime_bot,
+                    ctx.reply_locks.clone(),
                     group_list_arc_cloned,
                     group_id,
                     &ctx.data_path,
@@ -590,24 +716,78 @@ async fn get_image_summary(
     summary
 }
 
+fn push_indented(out: &mut String, indent: usize, s: &str) {
+    for _ in 0..indent {
+        out.push_str("  ");
+    }
+    out.push_str(s);
+    out.push('\n');
+}
+
 async fn package_messages(
     _data_path: &Path,
     img_path: &Path,
     msgs: &[MyMsg],
     vision_cfg_opt: Option<&config::VisionConfig>,
 ) -> String {
+    fn time_to_str(sec: i64) -> String {
+        match Local.timestamp_opt(sec, 0).single() {
+            Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            None => sec.to_string(),
+        }
+    }
+
     let mut out = String::new();
     let mut text_cnt = 0usize;
     let mut img_cnt = 0usize;
     let mut current_msg_id: Option<i32> = None;
+    let mut indent_level: usize = 1; // inside <message>
 
     for m in msgs.iter() {
         let user = display_name(&m.sender);
+        let time_str = time_to_str(m.time);
 
-        let content_str = match &m.content {
+        // switch message boundary
+        if current_msg_id != Some(m.msg_id) {
+            if current_msg_id.is_some() {
+                out.push_str("</message>\n");
+            }
+            current_msg_id = Some(m.msg_id);
+            out.push_str(&format!("<message id={}>\n", m.msg_id));
+            indent_level = 1; // reset for each message
+        }
+
+        match &m.content {
             MyMsgContent::Text(t) => {
-                text_cnt += 1;
-                t.clone()
+                let t_trim = t.trim();
+                // reply block open/close markers are passed-through to create nesting
+                if t_trim.starts_with("<reply ")
+                    && t_trim.ends_with('>')
+                    && !t_trim.contains("</reply>")
+                {
+                    push_indented(&mut out, indent_level, t_trim);
+                    indent_level += 1;
+                } else if t_trim == "</reply>" {
+                    if indent_level > 1 {
+                        indent_level -= 1;
+                    }
+                    push_indented(&mut out, indent_level, t_trim);
+                } else {
+                    text_cnt += 1;
+                    push_indented(
+                        &mut out,
+                        indent_level,
+                        &format!(
+                            "<segment type=\"text\" user_name=\"{}\" user_id={} time=\"{}\">",
+                            user, m.sender.user_id, time_str
+                        ),
+                    );
+                    indent_level += 1;
+                    // keep the text as-is (it may contain our lightweight tags like <at .../>)
+                    push_indented(&mut out, indent_level, t);
+                    indent_level -= 1;
+                    push_indented(&mut out, indent_level, "</segment>");
+                }
             }
             MyMsgContent::Img(rel) => {
                 img_cnt += 1;
@@ -617,34 +797,37 @@ async fn package_messages(
                     .and_then(|n| n.to_str())
                     .unwrap_or("image");
                 let cache_txt = img_abs.with_file_name(format!("{}.txt", fname));
-                // cache file named as same file name with extra .txt, e.g. a.jpg.txt
-                let mut res = String::from("[image]");
-                if let Some(summary) = get_image_summary(&img_abs, &cache_txt, vision_cfg_opt).await
-                {
-                    res = format!("[image: {}]", summary);
+                let summary_opt = get_image_summary(&img_abs, &cache_txt, vision_cfg_opt).await;
+
+                push_indented(
+                    &mut out,
+                    indent_level,
+                    &format!(
+                        "<segment type=\"image\" user_name=\"{}\" user_id={} time=\"{}\">",
+                        user, m.sender.user_id, time_str
+                    ),
+                );
+                indent_level += 1;
+                push_indented(
+                    &mut out,
+                    indent_level,
+                    &format!("<image file=\"{}\">", rel.display()),
+                );
+                if let Some(summary) = summary_opt {
+                    indent_level += 1;
+                    push_indented(&mut out, indent_level, "<summary>");
+                    indent_level += 1;
+                    push_indented(&mut out, indent_level, summary.trim());
+                    indent_level -= 1;
+                    push_indented(&mut out, indent_level, "</summary>");
+                    indent_level -= 1;
                 }
-                res
+                push_indented(&mut out, indent_level, "</image>");
+                indent_level -= 1;
+                push_indented(&mut out, indent_level, "</segment>");
             }
-        };
-
-        let time_str = match Local.timestamp_opt(m.time, 0).single() {
-            Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-            None => m.time.to_string(),
-        };
-
-        // 当遇到新的 msg_id 时，关闭上一个 <message>，并开启新的 <message>
-        if current_msg_id != Some(m.msg_id) {
-            if current_msg_id.is_some() {
-                out.push_str("</message>\n");
-            }
-            current_msg_id = Some(m.msg_id);
-            out.push_str(&format!("<message id={}>\n", m.msg_id));
         }
 
-        out.push_str(&format!(
-            "  <messag_seg user_name=\"{}\" user_id={} time=\"{}\">\n{}\n  </messag_seg>\n",
-            user, m.sender.user_id, time_str, content_str
-        ));
         debug!(
             "pack: user='{}' time={} kind={}",
             user,
@@ -681,10 +864,79 @@ fn display_name(s: &SenderInfo) -> String {
         .unwrap_or_else(|| s.user_id.to_string())
 }
 
+// Fetch reply message content with typed Message for recursive processing
+async fn fetch_reply_message(
+    bot: &kovi::RuntimeBot,
+    reply_id: i32,
+) -> Option<(SenderInfo, Message, Option<i64>)> {
+    let ret = match bot.get_msg(reply_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("get_msg failed for reply {}: {:?}", reply_id, e);
+            return None;
+        }
+    };
+
+    let sender_val = if let Some(v) = ret.data.get("sender") {
+        v
+    } else {
+        warn!("get_msg returned no sender field for reply {}", reply_id);
+        return None;
+    };
+
+    let user_id = sender_val
+        .get("user_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_default();
+    let nickname = sender_val
+        .get("nickname")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let card = sender_val
+        .get("card")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let sender_info = SenderInfo {
+        user_id,
+        nickname,
+        card,
+        sex: None,
+        age: None,
+        area: None,
+        level: None,
+        role: None,
+        title: None,
+    };
+
+    let msg_val = if let Some(v) = ret.data.get("message") {
+        v
+    } else {
+        warn!("get_msg returned no message field for reply {}", reply_id);
+        return None;
+    };
+
+    let orig_msg = match serde_json::from_value::<Message>(msg_val.clone()) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(
+                "failed to parse get_msg message for reply {}: {}",
+                reply_id, e
+            );
+            return None;
+        }
+    };
+
+    let time_opt = ret.data.get("time").and_then(|v| v.as_i64());
+
+    Some((sender_info, orig_msg, time_opt))
+}
+
 /// 清空当前积累的消息，调用 Dify，并在成功时回复且持久化会话 ID；失败则回填消息。
 /// reply_msg_id 用于在被 @ 触发时给回复消息加上引用。
 async fn clear_send_and_reply(
     bot: &kovi::RuntimeBot,
+    reply_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
     group_list_arc: Arc<Mutex<MyMsgList>>,
     group_id: i64,
     data_path: &Path,
@@ -726,8 +978,18 @@ async fn clear_send_and_reply(
     });
 
     let user_id = format!("GroupMessage:{}", group_id);
+
+    // Prepare per-group reply lock handle (lock only during send phase)
+    let group_lock_arc = {
+        let mut guard = reply_locks.lock().await;
+        guard
+            .entry(group_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
     let packaged = package_messages(data_path, img_path, &msgs_snapshot, cfg.vision.as_ref()).await;
     debug!("dify: packaged length={} chars", packaged.len());
+    debug!("dify: packaged={:#?}", packaged);
 
     let attempts = (1 + cfg.dify_retry_times as usize).max(1);
     let mut last_err: Option<String> = None;
@@ -828,6 +1090,8 @@ async fn clear_send_and_reply(
                 }
 
                 let total_segments = segments.len();
+                // Lock only for the send loop to avoid interleaving between concurrent replies
+                let _reply_guard = group_lock_arc.lock().await;
                 for (i, segment) in segments.into_iter().enumerate() {
                     let char_count = segment.chars().count();
                     let delay_per_char = if cfg.delay_per_char < 0.0 {
@@ -835,7 +1099,11 @@ async fn clear_send_and_reply(
                     } else {
                         cfg.delay_per_char
                     };
-                    let duration = Duration::from_secs_f64(char_count as f64 * delay_per_char);
+                    let duration =
+                        Duration::from_secs_f64(match char_count as f64 * delay_per_char {
+                            u if u > 1.5 => 1.5,
+                            u => u,
+                        });
 
                     debug!(
                         "sending segment {}/{} len={} delay={:?}",
@@ -891,13 +1159,50 @@ async fn clear_send_and_reply(
     }
 }
 
-async fn fetch_reply_content(bot: &kovi::RuntimeBot, reply_id: i32) -> Option<String> {
+async fn fetch_reply_content(bot: &kovi::RuntimeBot, reply_id: i32) -> Option<(String, String)> {
     let ret = match bot.get_msg(reply_id).await {
         Ok(v) => v,
         Err(e) => {
             warn!("get_msg failed for reply {}: {:?}", reply_id, e);
             return None;
         }
+    };
+
+    let sender = if let Some(v) = ret.data.get("sender") {
+        v
+    } else {
+        warn!("get_msg returned no sender field for reply {}", reply_id);
+        return None;
+    };
+
+    let sender_name = if let Some(v) = sender.get("nickname") {
+        if let Some(v) = v.as_str() {
+            v.to_string()
+        } else {
+            warn!(
+                "get_msg returned non-string nickname for reply {}",
+                reply_id
+            );
+            return None;
+        }
+    } else {
+        warn!("get_msg returned no name field for reply {}", reply_id);
+        return None;
+    };
+
+    let sender_id = if let Some(v) = sender.get("user_id") {
+        if let Some(v) = v.as_i64() {
+            v
+        } else {
+            warn!(
+                "get_msg returned non-integer user_id for reply {}",
+                reply_id
+            );
+            return None;
+        }
+    } else {
+        warn!("get_msg returned no id field for reply {}", reply_id);
+        return None;
     };
 
     let msg_val = if let Some(v) = ret.data.get("message") {
@@ -908,7 +1213,10 @@ async fn fetch_reply_content(bot: &kovi::RuntimeBot, reply_id: i32) -> Option<St
     };
 
     match serde_json::from_value::<Message>(msg_val.clone()) {
-        Ok(orig_msg) => Some(orig_msg.to_human_string()),
+        Ok(orig_msg) => Some((
+            format!("{}({})", sender_name, sender_id),
+            orig_msg.to_human_string(),
+        )),
         Err(e) => {
             warn!(
                 "failed to parse get_msg message for reply {}: {}",
@@ -953,11 +1261,13 @@ async fn main() {
     let msg_list = Arc::new(Mutex::new(initial_group_map));
     let last_seen = Arc::new(Mutex::new(HashMap::new()));
     let watching = Arc::new(Mutex::new(HashSet::new()));
+    let reply_locks = Arc::new(Mutex::new(HashMap::new()));
 
     let ctx = AppContext {
         msg_list,
         last_seen,
         watching,
+        reply_locks,
         config,
         data_path,
         img_path,
