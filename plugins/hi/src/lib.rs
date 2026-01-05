@@ -28,6 +28,7 @@ struct AppContext {
     msg_list: Arc<Mutex<HashMap<i64, Arc<Mutex<MyMsgList>>>>>,
     last_seen: Arc<Mutex<HashMap<i64, Instant>>>,
     watching: Arc<Mutex<HashSet<i64>>>,
+    mention_waiting: Arc<Mutex<HashSet<i64>>>,
     // Per-group reply lock to prevent interleaved segmented replies when multiple triggers occur
     reply_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
     config: config::Config,
@@ -38,6 +39,61 @@ struct AppContext {
 }
 
 impl AppContext {
+    // Spawn a waiter for @mention: wait for quiet period of mention_wait_seconds, resetting when new
+    // messages arrive; when expired, send reply once and exit.
+    async fn spawn_mention_waiter(
+        &self,
+        group_id: i64,
+        group_list_arc: Arc<Mutex<MyMsgList>>,
+        reply_msg_id: i32,
+    ) {
+        {
+            let mut set = self.mention_waiting.lock().await;
+            if set.contains(&group_id) {
+                return;
+            }
+            set.insert(group_id);
+        }
+
+        let ctx = self.clone();
+        kovi::spawn(async move {
+            // stop idle watcher for this group while we're waiting to avoid double triggers
+            {
+                let mut watching = ctx.watching.lock().await;
+                watching.remove(&group_id);
+            }
+
+            let wait = Duration::from_secs(ctx.config.mention_wait_seconds.max(1));
+            loop {
+                kovi::tokio::time::sleep(Duration::from_millis(500)).await;
+                let last_opt = {
+                    let last_seen = ctx.last_seen.lock().await;
+                    last_seen.get(&group_id).cloned()
+                };
+                let Some(last) = last_opt else {
+                    break;
+                };
+                if last.elapsed() >= wait {
+                    // quiet enough: send reply
+                    clear_send_and_reply(
+                        &ctx.runtime_bot,
+                        ctx.reply_locks.clone(),
+                        group_list_arc.clone(),
+                        group_id,
+                        &ctx.data_path,
+                        &ctx.img_path,
+                        &ctx.config,
+                        Some(reply_msg_id),
+                    )
+                    .await;
+                    break;
+                }
+            }
+
+            let mut set = ctx.mention_waiting.lock().await;
+            set.remove(&group_id);
+        });
+    }
     // Append segments from a Kovi Message into our MyMsgList, expanding reply segments
     // iteratively (no async recursion) so we can preserve nested images/text.
     // - Keeps msg_id of the outer message so nested replies render inside the same <message>
@@ -388,29 +444,9 @@ impl AppContext {
         }
 
         if mentioned_me {
-            debug!("mentioned me, clear and reply");
-
-            // Stop the idle watcher for this group
-            {
-                let mut watching = self.watching.lock().await;
-                watching.remove(&group_id);
-            }
-
-            let ctx = self.clone();
-            let group_list_arc_cloned = group_list_arc.clone();
-            kovi::spawn(async move {
-                clear_send_and_reply(
-                    &ctx.runtime_bot,
-                    ctx.reply_locks.clone(),
-                    group_list_arc_cloned,
-                    group_id,
-                    &ctx.data_path,
-                    &ctx.img_path,
-                    &ctx.config,
-                    Some(msg_id),
-                )
+            debug!("mentioned me, delay reply after quiet window");
+            self.spawn_mention_waiter(group_id, group_list_arc.clone(), msg_id)
                 .await;
-            });
         }
     }
 }
@@ -1043,50 +1079,52 @@ async fn clear_send_and_reply(
                     }
                 }
 
-                // Split and send
-                // Regex to capture the delimiter as well
-                // Treat newlines as explicit separators regardless of limit
-                // Also merge continuous newlines
-
-                let answer_trimmed = answer.trim_matches(|c: char| c == '\r' || c == '\n');
-                let mut start = 0;
+                // Split and send (optional)
                 let mut segments = Vec::new();
-                let max_segments = cfg.max_split_segments.max(1);
+                if cfg.enable_split_messages {
+                    // Regex to capture the delimiter as well
+                    // Treat newlines as explicit separators regardless of limit
+                    let answer_trimmed = answer.trim_matches(|c: char| c == '\r' || c == '\n');
+                    let mut start = 0;
+                    let max_segments = cfg.max_split_segments.max(1);
 
-                for mat in re.find_iter(answer_trimmed) {
-                    let delimiter = mat.as_str();
-                    let is_newline = delimiter.contains('\n');
+                    for mat in re.find_iter(answer_trimmed) {
+                        let delimiter = mat.as_str();
+                        let is_newline = delimiter.contains('\n');
 
-                    // Check limit only for soft splits (non-newlines)
-                    if !is_newline && segments.len() >= max_segments - 1 {
-                        continue;
+                        // Check limit only for soft splits (non-newlines)
+                        if !is_newline && segments.len() >= max_segments - 1 {
+                            continue;
+                        }
+
+                        let content = &answer_trimmed[start..mat.start()];
+                        let mut s = content.to_string();
+
+                        // If delimiter is not a comma and not newline, keep it attached.
+                        if !is_newline && delimiter != "，" {
+                            s.push_str(delimiter);
+                        }
+
+                        if !s.trim().is_empty() {
+                            segments.push(s);
+                        }
+                        start = mat.end();
                     }
 
-                    let content = &answer_trimmed[start..mat.start()];
-                    let mut s = content.to_string();
-
-                    // If delimiter is not a comma and not newline, keep it attached.
-                    if !is_newline && delimiter != "，" {
-                        s.push_str(delimiter);
+                    // Add the remaining part as the last segment
+                    if start < answer_trimmed.len() {
+                        let s = &answer_trimmed[start..];
+                        if !s.trim().is_empty() {
+                            segments.push(s.to_string());
+                        }
                     }
 
-                    if !s.trim().is_empty() {
-                        segments.push(s);
+                    // Fallback single segment
+                    if segments.is_empty() && !answer_trimmed.is_empty() {
+                        segments.push(answer_trimmed.to_string());
                     }
-                    start = mat.end();
-                }
-
-                // Add the remaining part as the last segment
-                if start < answer_trimmed.len() {
-                    let s = &answer_trimmed[start..];
-                    if !s.trim().is_empty() {
-                        segments.push(s.to_string());
-                    }
-                }
-
-                // If no segments found (rare if logic above is correct, but for safety)
-                if segments.is_empty() && !answer_trimmed.is_empty() {
-                    segments.push(answer_trimmed.to_string());
+                } else {
+                    segments.push(answer);
                 }
 
                 let total_segments = segments.len();
@@ -1099,11 +1137,14 @@ async fn clear_send_and_reply(
                     } else {
                         cfg.delay_per_char
                     };
-                    let duration =
+                    let duration = if cfg.enable_split_messages {
                         Duration::from_secs_f64(match char_count as f64 * delay_per_char {
                             u if u > 1.5 => 1.5,
                             u => u,
-                        });
+                        })
+                    } else {
+                        Duration::from_secs(0)
+                    };
 
                     debug!(
                         "sending segment {}/{} len={} delay={:?}",
@@ -1261,12 +1302,14 @@ async fn main() {
     let msg_list = Arc::new(Mutex::new(initial_group_map));
     let last_seen = Arc::new(Mutex::new(HashMap::new()));
     let watching = Arc::new(Mutex::new(HashSet::new()));
+    let mention_waiting = Arc::new(Mutex::new(HashSet::new()));
     let reply_locks = Arc::new(Mutex::new(HashMap::new()));
 
     let ctx = AppContext {
         msg_list,
         last_seen,
         watching,
+        mention_waiting,
         reply_locks,
         config,
         data_path,

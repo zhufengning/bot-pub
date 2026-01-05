@@ -7,6 +7,7 @@ use kovi::tokio::fs;
 pub struct Config {
     pub max_messages_per_group: usize,
     pub idle_seconds: u64,
+    pub mention_wait_seconds: u64,
     pub dify: Option<DifyConfig>,
     pub vision: Option<VisionConfig>,
     pub dify_retry_times: u32,
@@ -16,6 +17,7 @@ pub struct Config {
     pub idle_prob_growth_power: f64,
     pub max_split_segments: usize,
     pub delay_per_char: f64,
+    pub enable_split_messages: bool,
 }
 
 impl Default for Config {
@@ -23,6 +25,7 @@ impl Default for Config {
         Config {
             max_messages_per_group: 200,
             idle_seconds: 150,
+            mention_wait_seconds: 5,
             dify: None,
             vision: None,
             dify_retry_times: 2,
@@ -32,6 +35,7 @@ impl Default for Config {
             idle_prob_growth_power: 2.0,
             max_split_segments: 5,
             delay_per_char: 0.2,
+            enable_split_messages: true,
         }
     }
 }
@@ -56,6 +60,7 @@ pub async fn load_config(data_path: &Path) -> Config {
     struct RawConfig {
         max_messages_per_group: Option<usize>,
         idle_seconds: Option<u64>,
+        mention_wait_seconds: Option<u64>,
         dify: Option<DifyConfig>,
         vision: Option<VisionConfig>,
         dify_retry_times: Option<u32>,
@@ -65,12 +70,14 @@ pub async fn load_config(data_path: &Path) -> Config {
         idle_prob_growth_power: Option<f64>,
         max_split_segments: Option<usize>,
         delay_per_char: Option<f64>,
+        enable_split_messages: Option<bool>,
     }
 
     match toml::from_str::<RawConfig>(&s) {
         Ok(raw) => Config {
             max_messages_per_group: raw.max_messages_per_group.unwrap_or(200),
             idle_seconds: raw.idle_seconds.unwrap_or(150),
+            mention_wait_seconds: raw.mention_wait_seconds.unwrap_or(5),
             dify: raw.dify,
             vision: raw.vision,
             dify_retry_times: raw.dify_retry_times.unwrap_or(2),
@@ -80,6 +87,7 @@ pub async fn load_config(data_path: &Path) -> Config {
             idle_prob_growth_power: raw.idle_prob_growth_power.unwrap_or(2.0),
             max_split_segments: raw.max_split_segments.unwrap_or(5),
             delay_per_char: raw.delay_per_char.unwrap_or(0.2),
+            enable_split_messages: raw.enable_split_messages.unwrap_or(true),
         },
         Err(e) => {
             warn!("failed to parse config.toml: {}", e);
