@@ -24,7 +24,7 @@ impl From<&Sender> for SenderInfo {
             None => None,
         };
 
-        SenderInfo {
+        Self {
             user_id: s.user_id,
             nickname: s.nickname.clone(),
             card: s.card.clone(),
