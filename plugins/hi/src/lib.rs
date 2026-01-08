@@ -117,10 +117,10 @@ impl AppContext {
             .await;
 
             let mut waiting = ctx.mention_waiting.lock().await;
-            if let Some(handle) = waiting.get(&group_id) {
-                if handle.token == token {
-                    waiting.remove(&group_id);
-                }
+            if let Some(handle) = waiting.get(&group_id)
+                && handle.token == token
+            {
+                waiting.remove(&group_id);
             }
         });
     }
