@@ -1198,8 +1198,7 @@ async fn clear_send_and_reply(
             }
             Err(e) => {
                 warn!(
-                    "dify chat_messages failed (attempt {}/{} ) for group {}: {}",
-                    attempt, attempts, group_id, e
+                    "dify chat_messages failed (attempt {attempt}/{attempts} ) for group {group_id}: {e}"
                 );
                 last_err = Some(e.to_string());
                 kovi::tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1208,24 +1207,15 @@ async fn clear_send_and_reply(
     }
 
     // 全部失败：回填消息，避免丢失
-    error!(
-        "dify: all attempts failed for group {}: {:?}",
-        group_id, last_err
-    );
+    error!("dify: all attempts failed for group {group_id}: {last_err:?}",);
     let mut list2 = group_list_arc.lock().await;
     list2.messages.extend(msgs_snapshot.into_iter());
     let history_path = data_path.join(format!("{}.json", group_id));
     if let Ok(buf) = serde_json::to_vec_pretty(&*list2) {
         if let Err(e) = fs::write(&history_path, buf).await {
-            warn!(
-                "failed to write history after dify failure for group {}: {}",
-                group_id, e
-            );
+            warn!("failed to write history after dify failure for group {group_id}: {e}",);
         } else {
-            debug!(
-                "re-queued messages after dify failure for group {}",
-                group_id
-            );
+            debug!("re-queued messages after dify failure for group {group_id}");
         }
     }
 }
