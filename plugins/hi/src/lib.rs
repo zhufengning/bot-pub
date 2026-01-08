@@ -44,6 +44,230 @@ struct AppContext {
 }
 
 impl AppContext {
+    /// 清空当前积累的消息，调用 Dify，并在成功时回复且持久化会话 ID；失败则回填消息。
+    /// reply_msg_id 用于在被 @ 触发时给回复消息加上引用。
+    async fn clear_send_and_reply(
+        &self,
+        group_list_arc: Arc<Mutex<MyMsgList>>,
+        group_id: i64,
+        reply_msg_id: Option<i32>,
+    ) {
+        // 若未配置 Dify，直接跳过，不清空
+        let Some(dify_cfg) = &self.config.dify else {
+            warn!("dify config not set; skip idle send for group {group_id}");
+            return;
+        };
+
+        // 取走当前消息快照，避免请求期间的新消息被清空
+        let msgs_snapshot: Vec<MyMsg>;
+        let conversation_id_existing: Option<String>;
+        {
+            let mut list = group_list_arc.lock().await;
+            if list.messages.is_empty() {
+                info!("idle for group {group_id} but no messages");
+                return;
+            }
+            info!("idle for group {group_id}: sending to dify");
+            msgs_snapshot = mem::take(&mut list.messages);
+            conversation_id_existing = list.conversation_id.clone();
+        }
+
+        info!(
+            "dify: using base={} timeout={}s has_cid={}",
+            dify_cfg.base_url,
+            dify_cfg.timeout_seconds.unwrap_or(60),
+            conversation_id_existing.is_some()
+        );
+
+        let client = DifyClient::new_with_config(DifyConfig {
+            base_url: dify_cfg.base_url.clone(),
+            api_key: dify_cfg.api_key.clone(),
+            timeout: Duration::from_secs(dify_cfg.timeout_seconds.unwrap_or(60)),
+        });
+
+        let user_id = format!("GroupMessage:{group_id}");
+
+        // Prepare per-group reply lock handle (lock only during send phase)
+        let group_lock_arc = {
+            let mut guard = self.reply_locks.lock().await;
+            guard
+                .entry(group_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let packaged = package_messages(
+            &self.data_path,
+            &self.img_path,
+            &msgs_snapshot,
+            self.config.vision.as_ref(),
+        )
+        .await;
+        debug!("dify: packaged length={} chars", packaged.len());
+        debug!("dify: packaged={packaged:#?}");
+
+        let attempts = (1 + self.config.dify_retry_times as usize).max(1);
+        let mut last_err: Option<String> = None;
+        let re = Regex::new(r"([，。？！]|\n+)").unwrap();
+
+        for attempt in 1..=attempts {
+            let mut req = request::ChatMessagesRequest {
+                query: packaged.clone(),
+                user: user_id.clone(),
+                ..Default::default()
+            };
+            if let Some(cid) = &conversation_id_existing {
+                req.conversation_id = cid.clone();
+            }
+
+            match client.api().chat_messages(req).await {
+                Ok(resp) => {
+                    let mut answer = resp.answer;
+                    let new_cid = resp.base.conversation_id.clone();
+                    info!(
+                        "dify: got answer (attempt {}/{}), new_cid_set={} len={}",
+                        attempt,
+                        attempts,
+                        new_cid.is_some(),
+                        answer.len()
+                    );
+
+                    if answer.trim().is_empty() {
+                        answer = "bot选择沉默。".to_string();
+                    }
+
+                    // 成功：只更新会话 ID 并持久化，保留请求期间新收到的消息
+                    {
+                        let mut list = group_list_arc.lock().await;
+                        if list.conversation_id.is_none() {
+                            list.conversation_id = new_cid;
+                        }
+                        let history_path = self.data_path.join(format!("{}.json", group_id));
+                        if let Ok(buf) = serde_json::to_vec_pretty(&*list) {
+                            if let Err(e) = fs::write(&history_path, buf).await {
+                                warn!(
+                                    "failed to write history after dify success for group {}: {}",
+                                    group_id, e
+                                );
+                            } else {
+                                debug!(
+                                    "persisted conversation_id after dify success for group {}",
+                                    group_id
+                                );
+                            }
+                        }
+                    }
+
+                    // Split and send (optional)
+                    let mut segments = Vec::new();
+                    if self.config.enable_split_messages {
+                        // Regex to capture the delimiter as well
+                        // Treat newlines as explicit separators regardless of limit
+                        let answer_trimmed = answer.trim_matches(|c: char| c == '\r' || c == '\n');
+                        let mut start = 0;
+                        let max_segments = self.config.max_split_segments.max(1);
+
+                        for mat in re.find_iter(answer_trimmed) {
+                            let delimiter = mat.as_str();
+                            let is_newline = delimiter.contains('\n');
+
+                            // Check limit only for soft splits (non-newlines)
+                            if !is_newline && segments.len() >= max_segments - 1 {
+                                continue;
+                            }
+
+                            let content = &answer_trimmed[start..mat.start()];
+                            let mut s = content.to_string();
+
+                            // If delimiter is not a comma and not newline, keep it attached.
+                            if !is_newline && delimiter != "，" {
+                                s.push_str(delimiter);
+                            }
+
+                            if !s.trim().is_empty() {
+                                segments.push(s);
+                            }
+                            start = mat.end();
+                        }
+
+                        // Add the remaining part as the last segment
+                        if start < answer_trimmed.len() {
+                            let s = &answer_trimmed[start..];
+                            if !s.trim().is_empty() {
+                                segments.push(s.to_string());
+                            }
+                        }
+
+                        // Fallback single segment
+                        if segments.is_empty() && !answer_trimmed.is_empty() {
+                            segments.push(answer_trimmed.to_string());
+                        }
+                    } else {
+                        segments.push(answer);
+                    }
+
+                    let total_segments = segments.len();
+                    // Lock only for the send loop to avoid interleaving between concurrent replies
+                    let _reply_guard = group_lock_arc.lock().await;
+                    for (i, segment) in segments.into_iter().enumerate() {
+                        let char_count = segment.chars().count();
+                        let delay_per_char = if self.config.delay_per_char < 0.0 {
+                            0.0
+                        } else {
+                            self.config.delay_per_char
+                        };
+                        let duration = if self.config.enable_split_messages {
+                            Duration::from_secs_f64(match char_count as f64 * delay_per_char {
+                                u if u > 1.5 => 1.5,
+                                u => u,
+                            })
+                        } else {
+                            Duration::from_secs(0)
+                        };
+
+                        debug!(
+                            "sending segment {}/{} len={} delay={:?}",
+                            i + 1,
+                            total_segments,
+                            char_count,
+                            duration
+                        );
+                        kovi::tokio::time::sleep(duration).await;
+
+                        let mut msg: Message = segment.into();
+                        if let Some(reply_id) = reply_msg_id
+                            && i == 0
+                        {
+                            msg = msg.add_reply(reply_id);
+                        }
+
+                        self.runtime_bot.send_group_msg(group_id, msg);
+                    }
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "dify chat_messages failed (attempt {attempt}/{attempts} ) for group {group_id}: {e}"
+                    );
+                    last_err = Some(e.to_string());
+                    kovi::tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+
+        // 全部失败：回填消息，避免丢失
+        error!("dify: all attempts failed for group {group_id}: {last_err:?}",);
+        let mut list2 = group_list_arc.lock().await;
+        list2.messages.extend(msgs_snapshot.into_iter());
+        let history_path = self.data_path.join(format!("{}.json", group_id));
+        if let Ok(buf) = serde_json::to_vec_pretty(&*list2) {
+            if let Err(e) = fs::write(&history_path, buf).await {
+                warn!("failed to write history after dify failure for group {group_id}: {e}",);
+            } else {
+                debug!("re-queued messages after dify failure for group {group_id}");
+            }
+        }
+    }
+
     // Spawn a waiter for @mention: wait for quiet period of mention_wait_seconds, resetting when new
     // messages arrive; when expired, send reply once and exit.
     async fn spawn_mention_waiter(
@@ -104,17 +328,8 @@ impl AppContext {
             }
 
             // quiet enough or forced: send reply once
-            clear_send_and_reply(
-                &ctx.runtime_bot,
-                ctx.reply_locks.clone(),
-                group_list_arc.clone(),
-                group_id,
-                &ctx.data_path,
-                &ctx.img_path,
-                &ctx.config,
-                Some(reply_msg_id),
-            )
-            .await;
+            ctx.clear_send_and_reply(group_list_arc.clone(), group_id, Some(reply_msg_id))
+                .await;
 
             let mut waiting = ctx.mention_waiting.lock().await;
             if let Some(handle) = waiting.get(&group_id)
@@ -370,17 +585,8 @@ impl AppContext {
                 );
 
                 if roll < p {
-                    clear_send_and_reply(
-                        &ctx.runtime_bot,
-                        ctx.reply_locks.clone(),
-                        group_list_arc.clone(),
-                        group_id,
-                        &ctx.data_path,
-                        &ctx.img_path,
-                        &ctx.config,
-                        None,
-                    )
-                    .await;
+                    ctx.clear_send_and_reply(group_list_arc.clone(), group_id, None)
+                        .await;
 
                     break;
                 } else {
@@ -996,296 +1202,6 @@ async fn fetch_reply_message(
     let time_opt = ret.data.get("time").and_then(|v| v.as_i64());
 
     Some((sender_info, orig_msg, time_opt))
-}
-
-/// 清空当前积累的消息，调用 Dify，并在成功时回复且持久化会话 ID；失败则回填消息。
-/// reply_msg_id 用于在被 @ 触发时给回复消息加上引用。
-async fn clear_send_and_reply(
-    bot: &kovi::RuntimeBot,
-    reply_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
-    group_list_arc: Arc<Mutex<MyMsgList>>,
-    group_id: i64,
-    data_path: &Path,
-    img_path: &Path,
-    cfg: &config::Config,
-    reply_msg_id: Option<i32>,
-) {
-    // 若未配置 Dify，直接跳过，不清空
-    let Some(dify_cfg) = &cfg.dify else {
-        warn!("dify config not set; skip idle send for group {}", group_id);
-        return;
-    };
-
-    // 取走当前消息快照，避免请求期间的新消息被清空
-    let msgs_snapshot: Vec<MyMsg>;
-    let conversation_id_existing: Option<String>;
-    {
-        let mut list = group_list_arc.lock().await;
-        if list.messages.is_empty() {
-            info!("idle for group {} but no messages", group_id);
-            return;
-        }
-        info!("idle for group {}: sending to dify", group_id);
-        msgs_snapshot = mem::take(&mut list.messages);
-        conversation_id_existing = list.conversation_id.clone();
-    }
-
-    info!(
-        "dify: using base={} timeout={}s has_cid={}",
-        dify_cfg.base_url,
-        dify_cfg.timeout_seconds.unwrap_or(60),
-        conversation_id_existing.is_some()
-    );
-
-    let client = DifyClient::new_with_config(DifyConfig {
-        base_url: dify_cfg.base_url.clone(),
-        api_key: dify_cfg.api_key.clone(),
-        timeout: Duration::from_secs(dify_cfg.timeout_seconds.unwrap_or(60)),
-    });
-
-    let user_id = format!("GroupMessage:{}", group_id);
-
-    // Prepare per-group reply lock handle (lock only during send phase)
-    let group_lock_arc = {
-        let mut guard = reply_locks.lock().await;
-        guard
-            .entry(group_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    };
-    let packaged = package_messages(data_path, img_path, &msgs_snapshot, cfg.vision.as_ref()).await;
-    debug!("dify: packaged length={} chars", packaged.len());
-    debug!("dify: packaged={:#?}", packaged);
-
-    let attempts = (1 + cfg.dify_retry_times as usize).max(1);
-    let mut last_err: Option<String> = None;
-    let re = Regex::new(r"([，。？！]|\n+)").unwrap();
-
-    for attempt in 1..=attempts {
-        let mut req = request::ChatMessagesRequest {
-            query: packaged.clone(),
-            user: user_id.clone(),
-            ..Default::default()
-        };
-        if let Some(cid) = &conversation_id_existing {
-            req.conversation_id = cid.clone();
-        }
-
-        match client.api().chat_messages(req).await {
-            Ok(resp) => {
-                let mut answer = resp.answer;
-                let new_cid = resp.base.conversation_id.clone();
-                info!(
-                    "dify: got answer (attempt {}/{}), new_cid_set={} len={}",
-                    attempt,
-                    attempts,
-                    new_cid.is_some(),
-                    answer.len()
-                );
-
-                if answer.trim().is_empty() {
-                    answer = "bot选择沉默。".to_string();
-                }
-
-                // 成功：只更新会话 ID 并持久化，保留请求期间新收到的消息
-                {
-                    let mut list = group_list_arc.lock().await;
-                    if list.conversation_id.is_none() {
-                        list.conversation_id = new_cid;
-                    }
-                    let history_path = data_path.join(format!("{}.json", group_id));
-                    if let Ok(buf) = serde_json::to_vec_pretty(&*list) {
-                        if let Err(e) = fs::write(&history_path, buf).await {
-                            warn!(
-                                "failed to write history after dify success for group {}: {}",
-                                group_id, e
-                            );
-                        } else {
-                            debug!(
-                                "persisted conversation_id after dify success for group {}",
-                                group_id
-                            );
-                        }
-                    }
-                }
-
-                // Split and send (optional)
-                let mut segments = Vec::new();
-                if cfg.enable_split_messages {
-                    // Regex to capture the delimiter as well
-                    // Treat newlines as explicit separators regardless of limit
-                    let answer_trimmed = answer.trim_matches(|c: char| c == '\r' || c == '\n');
-                    let mut start = 0;
-                    let max_segments = cfg.max_split_segments.max(1);
-
-                    for mat in re.find_iter(answer_trimmed) {
-                        let delimiter = mat.as_str();
-                        let is_newline = delimiter.contains('\n');
-
-                        // Check limit only for soft splits (non-newlines)
-                        if !is_newline && segments.len() >= max_segments - 1 {
-                            continue;
-                        }
-
-                        let content = &answer_trimmed[start..mat.start()];
-                        let mut s = content.to_string();
-
-                        // If delimiter is not a comma and not newline, keep it attached.
-                        if !is_newline && delimiter != "，" {
-                            s.push_str(delimiter);
-                        }
-
-                        if !s.trim().is_empty() {
-                            segments.push(s);
-                        }
-                        start = mat.end();
-                    }
-
-                    // Add the remaining part as the last segment
-                    if start < answer_trimmed.len() {
-                        let s = &answer_trimmed[start..];
-                        if !s.trim().is_empty() {
-                            segments.push(s.to_string());
-                        }
-                    }
-
-                    // Fallback single segment
-                    if segments.is_empty() && !answer_trimmed.is_empty() {
-                        segments.push(answer_trimmed.to_string());
-                    }
-                } else {
-                    segments.push(answer);
-                }
-
-                let total_segments = segments.len();
-                // Lock only for the send loop to avoid interleaving between concurrent replies
-                let _reply_guard = group_lock_arc.lock().await;
-                for (i, segment) in segments.into_iter().enumerate() {
-                    let char_count = segment.chars().count();
-                    let delay_per_char = if cfg.delay_per_char < 0.0 {
-                        0.0
-                    } else {
-                        cfg.delay_per_char
-                    };
-                    let duration = if cfg.enable_split_messages {
-                        Duration::from_secs_f64(match char_count as f64 * delay_per_char {
-                            u if u > 1.5 => 1.5,
-                            u => u,
-                        })
-                    } else {
-                        Duration::from_secs(0)
-                    };
-
-                    debug!(
-                        "sending segment {}/{} len={} delay={:?}",
-                        i + 1,
-                        total_segments,
-                        char_count,
-                        duration
-                    );
-                    kovi::tokio::time::sleep(duration).await;
-
-                    let mut msg: Message = segment.into();
-                    if let Some(reply_id) = reply_msg_id
-                        && i == 0
-                    {
-                        msg = msg.add_reply(reply_id);
-                    }
-
-                    bot.send_group_msg(group_id, msg);
-                }
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    "dify chat_messages failed (attempt {attempt}/{attempts} ) for group {group_id}: {e}"
-                );
-                last_err = Some(e.to_string());
-                kovi::tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-
-    // 全部失败：回填消息，避免丢失
-    error!("dify: all attempts failed for group {group_id}: {last_err:?}",);
-    let mut list2 = group_list_arc.lock().await;
-    list2.messages.extend(msgs_snapshot.into_iter());
-    let history_path = data_path.join(format!("{}.json", group_id));
-    if let Ok(buf) = serde_json::to_vec_pretty(&*list2) {
-        if let Err(e) = fs::write(&history_path, buf).await {
-            warn!("failed to write history after dify failure for group {group_id}: {e}",);
-        } else {
-            debug!("re-queued messages after dify failure for group {group_id}");
-        }
-    }
-}
-
-async fn fetch_reply_content(bot: &kovi::RuntimeBot, reply_id: i32) -> Option<(String, String)> {
-    let ret = match bot.get_msg(reply_id).await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("get_msg failed for reply {}: {:?}", reply_id, e);
-            return None;
-        }
-    };
-
-    let sender = if let Some(v) = ret.data.get("sender") {
-        v
-    } else {
-        warn!("get_msg returned no sender field for reply {}", reply_id);
-        return None;
-    };
-
-    let sender_name = if let Some(v) = sender.get("nickname") {
-        if let Some(v) = v.as_str() {
-            v.to_string()
-        } else {
-            warn!(
-                "get_msg returned non-string nickname for reply {}",
-                reply_id
-            );
-            return None;
-        }
-    } else {
-        warn!("get_msg returned no name field for reply {}", reply_id);
-        return None;
-    };
-
-    let sender_id = if let Some(v) = sender.get("user_id") {
-        if let Some(v) = v.as_i64() {
-            v
-        } else {
-            warn!(
-                "get_msg returned non-integer user_id for reply {}",
-                reply_id
-            );
-            return None;
-        }
-    } else {
-        warn!("get_msg returned no id field for reply {}", reply_id);
-        return None;
-    };
-
-    let msg_val = if let Some(v) = ret.data.get("message") {
-        v
-    } else {
-        warn!("get_msg returned no message field for reply {}", reply_id);
-        return None;
-    };
-
-    match serde_json::from_value::<Message>(msg_val.clone()) {
-        Ok(orig_msg) => Some((
-            format!("{}({})", sender_name, sender_id),
-            orig_msg.to_human_string(),
-        )),
-        Err(e) => {
-            warn!(
-                "failed to parse get_msg message for reply {}: {}",
-                reply_id, e
-            );
-            None
-        }
-    }
 }
 
 #[kovi::plugin]
