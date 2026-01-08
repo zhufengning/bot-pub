@@ -22,7 +22,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config {
+        Self {
             max_messages_per_group: 200,
             idle_seconds: 150,
             mention_wait_seconds: 5,
@@ -41,21 +41,6 @@ impl Default for Config {
 }
 
 pub async fn load_config(data_path: &Path) -> Config {
-    let config_path = data_path.join("config.toml");
-
-    let buf = match fs::read(&config_path).await {
-        Ok(b) => b,
-        Err(_) => return Config::default(),
-    };
-
-    let s = match String::from_utf8(buf) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("config.toml is not valid UTF-8: {}", e);
-            return Config::default();
-        }
-    };
-
     #[derive(serde::Deserialize)]
     struct RawConfig {
         max_messages_per_group: Option<usize>,
@@ -72,6 +57,18 @@ pub async fn load_config(data_path: &Path) -> Config {
         delay_per_char: Option<f64>,
         enable_split_messages: Option<bool>,
     }
+
+    let config_path = data_path.join("config.toml");
+
+    let Ok(buf) = fs::read(&config_path).await else { return Config::default() };
+
+    let s = match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("config.toml is not valid UTF-8: {e}");
+            return Config::default();
+        }
+    };
 
     match toml::from_str::<RawConfig>(&s) {
         Ok(raw) => Config {
@@ -90,7 +87,7 @@ pub async fn load_config(data_path: &Path) -> Config {
             enable_split_messages: raw.enable_split_messages.unwrap_or(true),
         },
         Err(e) => {
-            warn!("failed to parse config.toml: {}", e);
+            warn!("failed to parse config.toml: {e}");
             Config::default()
         }
     }

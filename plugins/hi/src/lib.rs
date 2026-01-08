@@ -1,9 +1,11 @@
+#![allow(clippy::similar_names)]
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::Hasher;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::fmt::Write as _;
 
 use kovi::tokio::fs;
 use kovi::{
@@ -44,6 +46,230 @@ struct AppContext {
 }
 
 impl AppContext {
+    /// 清空当前积累的消息，调用 Dify，并在成功时回复且持久化会话 ID；失败则回填消息。
+    /// `reply_msg_id` 用于在被 @ 触发时给回复消息加上引用。
+    #[allow(clippy::too_many_lines)]
+    async fn clear_send_and_reply(
+        &self,
+        group_list_arc: Arc<Mutex<MyMsgList>>,
+        group_id: i64,
+        reply_msg_id: Option<i32>,
+    ) {
+        // 若未配置 Dify，直接跳过，不清空
+        let Some(dify_cfg) = &self.config.dify else {
+            warn!("dify config not set; skip idle send for group {group_id}");
+            return;
+        };
+
+        // 取走当前消息快照，避免请求期间的新消息被清空
+        let msgs_snapshot: Vec<MyMsg>;
+        let conversation_id_existing: Option<String>;
+        {
+            let mut list = group_list_arc.lock().await;
+            if list.messages.is_empty() {
+                info!("idle for group {group_id} but no messages");
+                return;
+            }
+            info!("idle for group {group_id}: sending to dify");
+            msgs_snapshot = mem::take(&mut list.messages);
+            conversation_id_existing = list.conversation_id.clone();
+        }
+
+        info!(
+            "dify: using base={} timeout={}s has_cid={}",
+            dify_cfg.base_url,
+            dify_cfg.timeout_seconds.unwrap_or(60),
+            conversation_id_existing.is_some()
+        );
+
+        let client = DifyClient::new_with_config(DifyConfig {
+            base_url: dify_cfg.base_url.clone(),
+            api_key: dify_cfg.api_key.clone(),
+            timeout: Duration::from_secs(dify_cfg.timeout_seconds.unwrap_or(60)),
+        });
+
+        let user_id = format!("GroupMessage:{group_id}");
+
+        // Prepare per-group reply lock handle (lock only during send phase)
+        let group_lock_arc = {
+            let mut guard = self.reply_locks.lock().await;
+            guard
+                .entry(group_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let packaged = package_messages(
+            &self.data_path,
+            &self.img_path,
+            &msgs_snapshot,
+            self.config.vision.as_ref(),
+        )
+        .await;
+        debug!("dify: packaged length={} chars", packaged.len());
+        debug!("dify: packaged={packaged:#?}");
+
+        let attempts = (1 + self.config.dify_retry_times as usize).max(1);
+        let mut last_err: Option<String> = None;
+        let re = Regex::new(r"([，。？！]|\n+)").unwrap();
+
+        for attempt in 1..=attempts {
+            let mut req = request::ChatMessagesRequest {
+                query: packaged.clone(),
+                user: user_id.clone(),
+                ..Default::default()
+            };
+            if let Some(cid) = &conversation_id_existing {
+                req.conversation_id.clone_from(cid);
+            }
+
+            match client.api().chat_messages(req).await {
+                Ok(resp) => {
+                    let mut answer = resp.answer;
+                    let new_cid = resp.base.conversation_id.clone();
+                    info!(
+                        "dify: got answer (attempt {}/{}), new_cid_set={} len={}",
+                        attempt,
+                        attempts,
+                        new_cid.is_some(),
+                        answer.len()
+                    );
+
+                    if answer.trim().is_empty() {
+                        answer = "bot选择沉默。".to_string();
+                    }
+
+                    // 成功：只更新会话 ID 并持久化，保留请求期间新收到的消息
+                    {
+                        let mut list = group_list_arc.lock().await;
+                        if list.conversation_id.is_none() {
+                            list.conversation_id = new_cid;
+                        }
+                        let history_path = self.data_path.join(format!("{group_id}.json"));
+                        if let Ok(buf) = serde_json::to_vec_pretty(&*list) {
+                            if let Err(e) = fs::write(&history_path, buf).await {
+                                warn!(
+                                    "failed to write history after dify success for group {group_id}: {e}"
+                                );
+                            } else {
+                                debug!(
+                                    "persisted conversation_id after dify success for group {group_id}"
+                                );
+                            }
+                        }
+                    }
+
+                    // Split and send (optional)
+                    let mut segments = Vec::new();
+                    if self.config.enable_split_messages {
+                        // Regex to capture the delimiter as well
+                        // Treat newlines as explicit separators regardless of limit
+                        let answer_trimmed = answer.trim_matches(|c: char| c == '\r' || c == '\n');
+                        let mut start = 0;
+                        let max_segments = self.config.max_split_segments.max(1);
+
+                        for mat in re.find_iter(answer_trimmed) {
+                            let delimiter = mat.as_str();
+                            let is_newline = delimiter.contains('\n');
+
+                            // Check limit only for soft splits (non-newlines)
+                            if !is_newline && segments.len() >= max_segments - 1 {
+                                continue;
+                            }
+
+                            let content = &answer_trimmed[start..mat.start()];
+                            let mut s = content.to_string();
+
+                            // If delimiter is not a comma and not newline, keep it attached.
+                            if !is_newline && delimiter != "，" {
+                                s.push_str(delimiter);
+                            }
+
+                            if !s.trim().is_empty() {
+                                segments.push(s);
+                            }
+                            start = mat.end();
+                        }
+
+                        // Add the remaining part as the last segment
+                        if start < answer_trimmed.len() {
+                            let s = &answer_trimmed[start..];
+                            if !s.trim().is_empty() {
+                                segments.push(s.to_string());
+                            }
+                        }
+
+                        // Fallback single segment
+                        if segments.is_empty() && !answer_trimmed.is_empty() {
+                            segments.push(answer_trimmed.to_string());
+                        }
+                    } else {
+                        segments.push(answer);
+                    }
+
+                    let total_segments = segments.len();
+                    // Lock only for the send loop to avoid interleaving between concurrent replies
+                    let _reply_guard = group_lock_arc.lock().await;
+                    for (i, segment) in segments.into_iter().enumerate() {
+                        let char_count = segment.chars().count();
+                        let delay_per_char = if self.config.delay_per_char < 0.0 {
+                            0.0
+                        } else {
+                            self.config.delay_per_char
+                        };
+                        #[allow(clippy::cast_precision_loss)]
+                        let duration = if self.config.enable_split_messages {
+                            Duration::from_secs_f64(match char_count as f64 * delay_per_char {
+                                u if u > 1.5 => 1.5,
+                                u => u,
+                            })
+                        } else {
+                            Duration::from_secs(0)
+                        };
+
+                        debug!(
+                            "sending segment {}/{} len={} delay={:?}",
+                            i + 1,
+                            total_segments,
+                            char_count,
+                            duration
+                        );
+                        kovi::tokio::time::sleep(duration).await;
+
+                        let mut msg: Message = segment.into();
+                        if let Some(reply_id) = reply_msg_id
+                            && i == 0
+                        {
+                            msg = msg.add_reply(reply_id);
+                        }
+
+                        self.runtime_bot.send_group_msg(group_id, msg);
+                    }
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "dify chat_messages failed (attempt {attempt}/{attempts} ) for group {group_id}: {e}"
+                    );
+                    last_err = Some(e.to_string());
+                    kovi::tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+
+        // 全部失败：回填消息，避免丢失
+        error!("dify: all attempts failed for group {group_id}: {last_err:?}",);
+        let mut list2 = group_list_arc.lock().await;
+        list2.messages.extend(msgs_snapshot.into_iter());
+        let history_path = self.data_path.join(format!("{group_id}.json"));
+        if let Ok(buf) = serde_json::to_vec_pretty(&*list2) {
+            if let Err(e) = fs::write(&history_path, buf).await {
+                warn!("failed to write history after dify failure for group {group_id}: {e}",);
+            } else {
+                debug!("re-queued messages after dify failure for group {group_id}");
+            }
+        }
+    }
+
     // Spawn a waiter for @mention: wait for quiet period of mention_wait_seconds, resetting when new
     // messages arrive; when expired, send reply once and exit.
     async fn spawn_mention_waiter(
@@ -57,8 +283,7 @@ impl AppContext {
             let mut waiting = self.mention_waiting.lock().await;
             let next_token = waiting
                 .get(&group_id)
-                .map(|handle| handle.token.wrapping_add(1))
-                .unwrap_or(1);
+                .map_or(1, |handle| handle.token.wrapping_add(1));
             let prev = waiting.insert(
                 group_id,
                 MentionWaiterHandle {
@@ -66,6 +291,9 @@ impl AppContext {
                     notifier: notifier.clone(),
                 },
             );
+
+            drop(waiting);
+
             (next_token, prev.map(|handle| handle.notifier))
         };
 
@@ -93,7 +321,7 @@ impl AppContext {
 
                 let last_opt = {
                     let last_seen = ctx.last_seen.lock().await;
-                    last_seen.get(&group_id).cloned()
+                    last_seen.get(&group_id).copied()
                 };
                 let Some(last) = last_opt else {
                     break;
@@ -104,23 +332,14 @@ impl AppContext {
             }
 
             // quiet enough or forced: send reply once
-            clear_send_and_reply(
-                &ctx.runtime_bot,
-                ctx.reply_locks.clone(),
-                group_list_arc.clone(),
-                group_id,
-                &ctx.data_path,
-                &ctx.img_path,
-                &ctx.config,
-                Some(reply_msg_id),
-            )
-            .await;
+            ctx.clear_send_and_reply(group_list_arc.clone(), group_id, Some(reply_msg_id))
+                .await;
 
             let mut waiting = ctx.mention_waiting.lock().await;
-            if let Some(handle) = waiting.get(&group_id) {
-                if handle.token == token {
-                    waiting.remove(&group_id);
-                }
+            if let Some(handle) = waiting.get(&group_id)
+                && handle.token == token
+            {
+                waiting.remove(&group_id);
             }
         });
     }
@@ -129,6 +348,7 @@ impl AppContext {
     // - Keeps msg_id of the outer message so nested replies render inside the same <message>
     // - Emits <reply ...> and </reply> markers as Text entries for the packager
     // - Downloads images to hashed files and preserves them as Img entries
+    #[allow(clippy::too_many_lines)]
     async fn append_segments_recursive(
         &self,
         msg_list: &mut MyMsgList,
@@ -244,7 +464,7 @@ impl AppContext {
                                 {
                                     "<at target=\"self\" />".to_string()
                                 } else {
-                                    format!("<at target=\"{}\" />", qq)
+                                    format!("<at target=\"{qq}\" />")
                                 };
                                 msg_list.messages.push(MyMsg {
                                     group_id,
@@ -257,6 +477,7 @@ impl AppContext {
                             }
                             "reply" => {
                                 let raw_id = &v.data["id"];
+                                #[allow(clippy::cast_possible_truncation)]
                                 let reply_msg_id_opt =
                                     raw_id.as_i64().map(|v| v as i32).or_else(|| {
                                         raw_id.as_str().and_then(|s| s.parse::<i32>().ok())
@@ -279,7 +500,7 @@ impl AppContext {
                                             reply_time: orig_time,
                                         });
                                     } else {
-                                        warn!("reply segment fetch failed: id={}", reply_msg_id);
+                                        warn!("reply segment fetch failed: id={reply_msg_id}");
                                         has_unknown_seg = true;
                                         msg_list.messages.push(MyMsg {
                                             group_id,
@@ -293,7 +514,7 @@ impl AppContext {
                                         enforce_limit(msg_list, self.config.max_messages_per_group);
                                     }
                                 } else {
-                                    warn!("reply segment without valid id: {:?}", raw_id);
+                                    warn!("reply segment without valid id: {raw_id:?}");
                                     has_unknown_seg = true;
                                     msg_list.messages.push(MyMsg {
                                         group_id,
@@ -345,12 +566,12 @@ impl AppContext {
                 kovi::tokio::time::sleep(Duration::from_secs(1)).await;
 
                 let last_opt = {
-                    let watching = ctx.watching.lock().await;
-                    if !watching.contains(&group_id) {
+                    if !ctx.watching.lock().await.contains(&group_id) {
                         break;
                     }
+
                     let last_seen = ctx.last_seen.lock().await;
-                    last_seen.get(&group_id).cloned()
+                    last_seen.get(&group_id).copied()
                 };
 
                 let Some(last) = last_opt else {
@@ -365,29 +586,18 @@ impl AppContext {
                 let p = calc_idle_trigger_prob(idle_hits, &ctx.config);
                 let roll: f64 = rand::random();
                 info!(
-                    "idle watcher: group {} idle_hits={} prob={} roll={}",
-                    group_id, idle_hits, p, roll
+                    "idle watcher: group {group_id} idle_hits={idle_hits} prob={p} roll={roll}"
                 );
 
                 if roll < p {
-                    clear_send_and_reply(
-                        &ctx.runtime_bot,
-                        ctx.reply_locks.clone(),
-                        group_list_arc.clone(),
-                        group_id,
-                        &ctx.data_path,
-                        &ctx.img_path,
-                        &ctx.config,
-                        None,
-                    )
-                    .await;
+                    ctx.clear_send_and_reply(group_list_arc.clone(), group_id, None)
+                        .await;
 
                     break;
-                } else {
-                    {
-                        let mut last_seen = ctx.last_seen.lock().await;
-                        last_seen.insert(group_id, Instant::now());
-                    }
+                }
+                {
+                    let mut last_seen = ctx.last_seen.lock().await;
+                    last_seen.insert(group_id, Instant::now());
                 }
             }
 
@@ -439,8 +649,7 @@ impl AppContext {
                 if qq == self_id_val.to_string() {
                     mentioned_me = true;
                     debug!(
-                        "detected @mention to self in group {} message_id {}",
-                        group_id, msg_id
+                        "detected @mention to self in group {group_id} message_id {msg_id}"
                     );
                 }
             }
@@ -464,14 +673,16 @@ impl AppContext {
             });
         }
 
-        let history_path = self.data_path.join(format!("{}.json", group_id));
+        let history_path = self.data_path.join(format!("{group_id}.json"));
         if let Ok(buf) = serde_json::to_vec_pretty(&*msg_list) {
             if let Err(e) = fs::write(&history_path, buf).await {
-                warn!("failed to write history for group {}: {}", group_id, e);
+                warn!("failed to write history for group {group_id}: {e}");
             }
         } else {
-            warn!("failed to serialize history for group {}", group_id);
+            warn!("failed to serialize history for group {group_id}");
         }
+
+        drop(msg_list);
 
         if mentioned_me {
             debug!("mentioned me, delay reply after quiet window");
@@ -502,17 +713,17 @@ fn calc_idle_trigger_prob(hit: u32, cfg: &config::Config) -> f64 {
         p_max = p0;
     }
 
-    let full_hits = cfg.idle_prob_full_hits.max(1) as f64;
+    let full_hits = f64::from(cfg.idle_prob_full_hits.max(1));
     let power = if cfg.idle_prob_growth_power <= 0.0 {
         1.0
     } else {
         cfg.idle_prob_growth_power
     };
 
-    let n = (hit as f64).min(full_hits);
+    let n = f64::from(hit).min(full_hits);
     let x = (n / full_hits).clamp(0.0, 1.0);
     let y = x.powf(power);
-    let p = p0 + (p_max - p0) * y;
+    let p = (p_max - p0).mul_add(y, p0);
     p.clamp(0.0, 1.0)
 }
 
@@ -522,7 +733,7 @@ async fn load_history(data_path: &PathBuf) -> HashMap<i64, MyMsgList> {
     let mut dir = match fs::read_dir(&data_path).await {
         Ok(dir) => dir,
         Err(e) => {
-            warn!("failed to read history dir {:?}: {}", data_path, e);
+            warn!("failed to read history dir {}: {e}", data_path.display());
             return group_map;
         }
     };
@@ -537,7 +748,7 @@ async fn load_history(data_path: &PathBuf) -> HashMap<i64, MyMsgList> {
         let buf = match fs::read(&path).await {
             Ok(buf) => buf,
             Err(e) => {
-                warn!("failed to read history file {:?}: {}", path, e);
+                warn!("failed to read history file {}: {e}", path.display());
                 continue;
             }
         };
@@ -554,7 +765,7 @@ async fn load_history(data_path: &PathBuf) -> HashMap<i64, MyMsgList> {
                 });
                 // prefer keeping existing conversation_id if already set
                 if entry.conversation_id.is_none() {
-                    entry.conversation_id = list.conversation_id.clone();
+                    entry.conversation_id.clone_from(&list.conversation_id);
                 }
                 entry.messages.push(msg);
                 pushed_any = true;
@@ -589,7 +800,7 @@ async fn load_history(data_path: &PathBuf) -> HashMap<i64, MyMsgList> {
                     }
                 }
                 Err(e) => {
-                    warn!("failed to parse history file {:?}: {}", path, e);
+                    warn!("failed to parse history file {}: {e}", path.display());
                 }
             }
         }
@@ -599,14 +810,14 @@ async fn load_history(data_path: &PathBuf) -> HashMap<i64, MyMsgList> {
 
 async fn download_to_hashed_file(target_dir: &PathBuf, url: &str) -> Option<PathBuf> {
     if let Err(e) = fs::create_dir_all(target_dir).await {
-        warn!("failed to create target dir {:?}: {}", target_dir, e);
+        warn!("failed to create target dir {}: {e}", target_dir.display());
         return None;
     }
 
     let resp = match reqwest::get(url).await {
         Ok(r) => r,
         Err(e) => {
-            warn!("failed to download file {}: {}", url, e);
+            warn!("failed to download file {url}: {e}");
             return None;
         }
     };
@@ -632,7 +843,7 @@ async fn download_to_hashed_file(target_dir: &PathBuf, url: &str) -> Option<Path
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            warn!("failed to read file body {}: {}", url, e);
+            warn!("failed to read file body {url}: {e}");
             return None;
         }
     };
@@ -640,16 +851,15 @@ async fn download_to_hashed_file(target_dir: &PathBuf, url: &str) -> Option<Path
     let mut hasher = DefaultHasher::new();
     hasher.write(&bytes);
     let hash = hasher.finish();
-    let file_name = format!("{:x}.{}", hash, ext);
+    let file_name = format!("{hash:x}.{ext}");
     let file_path = target_dir.join(&file_name);
 
-    let need_write = match fs::metadata(&file_path).await {
-        Ok(meta) => !meta.is_file(),
-        Err(_) => true,
-    };
+    let need_write = fs::metadata(&file_path)
+        .await
+        .map_or(true, |meta| !meta.is_file());
 
     if need_write && let Err(e) = fs::write(&file_path, &bytes).await {
-        warn!("failed to save file {:?}: {}", file_path, e);
+        warn!("failed to save file {}: {e}", file_path.display());
         return None;
     }
 
@@ -668,12 +878,12 @@ async fn summarize_image_via_openai(
     image_path: &Path,
 ) -> Option<String> {
     let url = join_url(&vision_cfg.base_url, "/v1/chat/completions");
-    debug!("vision: preparing request to {} for {:?}", url, image_path);
+    debug!("vision: preparing request to {url} for {}", image_path.display());
 
     let img_bytes = match fs::read(image_path).await {
         Ok(b) => b,
         Err(e) => {
-            warn!("failed to read image for vision {:?}: {}", image_path, e);
+            warn!("failed to read image for vision {}: {e}", image_path.display());
             return None;
         }
     };
@@ -691,7 +901,7 @@ async fn summarize_image_via_openai(
     };
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
-    let data_url = format!("data:{};base64,{}", mime, b64);
+    let data_url = format!("data:{mime};base64,{b64}");
 
     let body = serde_json::json!({
         "model": vision_cfg.model,
@@ -713,7 +923,7 @@ async fn summarize_image_via_openai(
     {
         Ok(r) => r,
         Err(e) => {
-            warn!("vision api request failed: {}", e);
+            warn!("vision api request failed: {e}");
             return None;
         }
     };
@@ -722,8 +932,7 @@ async fn summarize_image_via_openai(
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
         warn!(
-            "vision api non-success status: {} body: {}",
-            status, body_text
+            "vision api non-success status: {status} body: {body_text}"
         );
         return None;
     }
@@ -731,16 +940,16 @@ async fn summarize_image_via_openai(
     let v: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            warn!("vision api parse failed: {}", e);
+            warn!("vision api parse failed: {e}");
             return None;
         }
     };
 
     let summary = v["choices"][0]["message"]["content"]
         .as_str()
-        .map(|s| s.to_string());
+        .map(ToString::to_string);
     if summary.is_none() {
-        warn!("vision api returned unexpected payload: {}", v);
+        warn!("vision api returned unexpected payload: {v}");
     }
     summary
 }
@@ -751,18 +960,18 @@ async fn get_image_summary(
     vision_cfg_opt: Option<&config::VisionConfig>,
 ) -> Option<String> {
     // try cache first
-    debug!("vision: try cache at {:?}", cache_txt_path);
+    debug!("vision: try cache at {}", cache_txt_path.display());
     if let Ok(buf) = fs::read(cache_txt_path).await
         && let Ok(s) = String::from_utf8(buf)
     {
-        debug!("vision: cache hit for {:?}", img_abs_path);
+        debug!("vision: cache hit for {}", img_abs_path.display());
         return Some(s);
     }
 
     let Some(vision_cfg) = vision_cfg_opt else {
         info!(
-            "vision: no config provided, skip summarizing for {:?}",
-            img_abs_path
+            "vision: no config provided, skip summarizing for {}",
+            img_abs_path.display()
         );
         return None;
     };
@@ -772,11 +981,10 @@ async fn get_image_summary(
         let s = s.trim();
         if let Err(e) = fs::write(cache_txt_path, s.as_bytes()).await {
             warn!(
-                "failed to write image summary cache {:?}: {}",
-                cache_txt_path, e
+                "failed to write image summary cache {}: {e}", cache_txt_path.display(),
             );
         } else {
-            debug!("vision: wrote cache {:?}", cache_txt_path);
+            debug!("vision: wrote cache {}" , cache_txt_path.display());
         }
     }
     summary
@@ -790,6 +998,7 @@ fn push_indented(out: &mut String, indent: usize, s: &str) {
     out.push('\n');
 }
 
+#[allow(clippy::too_many_lines)]
 async fn package_messages(
     _data_path: &Path,
     img_path: &Path,
@@ -797,10 +1006,9 @@ async fn package_messages(
     vision_cfg_opt: Option<&config::VisionConfig>,
 ) -> String {
     fn time_to_str(sec: i64) -> String {
-        match Local.timestamp_opt(sec, 0).single() {
-            Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-            None => sec.to_string(),
-        }
+        Local.timestamp_opt(sec, 0)
+            .single()
+            .map_or_else(|| sec.to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
     }
 
     let mut out = String::new();
@@ -809,7 +1017,7 @@ async fn package_messages(
     let mut current_msg_id: Option<i32> = None;
     let mut indent_level: usize = 1; // inside <message>
 
-    for m in msgs.iter() {
+    for m in msgs {
         let user = display_name(&m.sender);
         let time_str = time_to_str(m.time);
 
@@ -819,7 +1027,7 @@ async fn package_messages(
                 out.push_str("</message>\n");
             }
             current_msg_id = Some(m.msg_id);
-            out.push_str(&format!("<message id={}>\n", m.msg_id));
+            let _ = writeln!(out, "<message id={0}>", m.msg_id);
             indent_level = 1; // reset for each message
         }
 
@@ -862,7 +1070,7 @@ async fn package_messages(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("image");
-                let cache_txt = img_abs.with_file_name(format!("{}.txt", fname));
+                let cache_txt = img_abs.with_file_name(format!("{fname}.txt"));
                 let summary_opt = get_image_summary(&img_abs, &cache_txt, vision_cfg_opt).await;
 
                 push_indented(
@@ -923,7 +1131,7 @@ fn display_name(s: &SenderInfo) -> String {
         opt.as_ref()
             .map(|v| v.trim())
             .filter(|v| !v.is_empty())
-            .map(|v| v.to_string())
+            .map(ToString::to_string)
     };
     take_non_empty(&s.card)
         .or_else(|| take_non_empty(&s.nickname))
@@ -938,30 +1146,28 @@ async fn fetch_reply_message(
     let ret = match bot.get_msg(reply_id).await {
         Ok(v) => v,
         Err(e) => {
-            warn!("get_msg failed for reply {}: {:?}", reply_id, e);
+            warn!("get_msg failed for reply {reply_id}: {e:?}");
             return None;
         }
     };
 
-    let sender_val = if let Some(v) = ret.data.get("sender") {
-        v
-    } else {
-        warn!("get_msg returned no sender field for reply {}", reply_id);
+    let Some(sender_val) = ret.data.get("sender") else {
+        warn!("get_msg returned no sender field for reply {reply_id}");
         return None;
     };
 
     let user_id = sender_val
         .get("user_id")
-        .and_then(|v| v.as_i64())
+        .and_then(kovi::serde_json::Value::as_i64)
         .unwrap_or_default();
     let nickname = sender_val
         .get("nickname")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .map(ToString::to_string);
     let card = sender_val
         .get("card")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .map(ToString::to_string);
 
     let sender_info = SenderInfo {
         user_id,
@@ -975,10 +1181,8 @@ async fn fetch_reply_message(
         title: None,
     };
 
-    let msg_val = if let Some(v) = ret.data.get("message") {
-        v
-    } else {
-        warn!("get_msg returned no message field for reply {}", reply_id);
+    let Some(msg_val) = ret.data.get("message") else {
+        warn!("get_msg returned no message field for reply {reply_id}");
         return None;
     };
 
@@ -986,316 +1190,15 @@ async fn fetch_reply_message(
         Ok(m) => m,
         Err(e) => {
             warn!(
-                "failed to parse get_msg message for reply {}: {}",
-                reply_id, e
+                "failed to parse get_msg message for reply {reply_id}: {e}"
             );
             return None;
         }
     };
 
-    let time_opt = ret.data.get("time").and_then(|v| v.as_i64());
+    let time_opt = ret.data.get("time").and_then(kovi::serde_json::Value::as_i64);
 
     Some((sender_info, orig_msg, time_opt))
-}
-
-/// 清空当前积累的消息，调用 Dify，并在成功时回复且持久化会话 ID；失败则回填消息。
-/// reply_msg_id 用于在被 @ 触发时给回复消息加上引用。
-async fn clear_send_and_reply(
-    bot: &kovi::RuntimeBot,
-    reply_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
-    group_list_arc: Arc<Mutex<MyMsgList>>,
-    group_id: i64,
-    data_path: &Path,
-    img_path: &Path,
-    cfg: &config::Config,
-    reply_msg_id: Option<i32>,
-) {
-    // 若未配置 Dify，直接跳过，不清空
-    let Some(dify_cfg) = &cfg.dify else {
-        warn!("dify config not set; skip idle send for group {}", group_id);
-        return;
-    };
-
-    // 取走当前消息快照，避免请求期间的新消息被清空
-    let msgs_snapshot: Vec<MyMsg>;
-    let conversation_id_existing: Option<String>;
-    {
-        let mut list = group_list_arc.lock().await;
-        if list.messages.is_empty() {
-            info!("idle for group {} but no messages", group_id);
-            return;
-        }
-        info!("idle for group {}: sending to dify", group_id);
-        msgs_snapshot = mem::take(&mut list.messages);
-        conversation_id_existing = list.conversation_id.clone();
-    }
-
-    info!(
-        "dify: using base={} timeout={}s has_cid={}",
-        dify_cfg.base_url,
-        dify_cfg.timeout_seconds.unwrap_or(60),
-        conversation_id_existing.is_some()
-    );
-
-    let client = DifyClient::new_with_config(DifyConfig {
-        base_url: dify_cfg.base_url.clone(),
-        api_key: dify_cfg.api_key.clone(),
-        timeout: Duration::from_secs(dify_cfg.timeout_seconds.unwrap_or(60)),
-    });
-
-    let user_id = format!("GroupMessage:{}", group_id);
-
-    // Prepare per-group reply lock handle (lock only during send phase)
-    let group_lock_arc = {
-        let mut guard = reply_locks.lock().await;
-        guard
-            .entry(group_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    };
-    let packaged = package_messages(data_path, img_path, &msgs_snapshot, cfg.vision.as_ref()).await;
-    debug!("dify: packaged length={} chars", packaged.len());
-    debug!("dify: packaged={:#?}", packaged);
-
-    let attempts = (1 + cfg.dify_retry_times as usize).max(1);
-    let mut last_err: Option<String> = None;
-    let re = Regex::new(r"([，。？！]|\n+)").unwrap();
-
-    for attempt in 1..=attempts {
-        let mut req = request::ChatMessagesRequest {
-            query: packaged.clone(),
-            user: user_id.clone(),
-            ..Default::default()
-        };
-        if let Some(cid) = &conversation_id_existing {
-            req.conversation_id = cid.clone();
-        }
-
-        match client.api().chat_messages(req).await {
-            Ok(resp) => {
-                let mut answer = resp.answer;
-                let new_cid = resp.base.conversation_id.clone();
-                info!(
-                    "dify: got answer (attempt {}/{}), new_cid_set={} len={}",
-                    attempt,
-                    attempts,
-                    new_cid.is_some(),
-                    answer.len()
-                );
-
-                if answer.trim().is_empty() {
-                    answer = "bot选择沉默。".to_string();
-                }
-
-                // 成功：只更新会话 ID 并持久化，保留请求期间新收到的消息
-                {
-                    let mut list = group_list_arc.lock().await;
-                    if list.conversation_id.is_none() {
-                        list.conversation_id = new_cid;
-                    }
-                    let history_path = data_path.join(format!("{}.json", group_id));
-                    if let Ok(buf) = serde_json::to_vec_pretty(&*list) {
-                        if let Err(e) = fs::write(&history_path, buf).await {
-                            warn!(
-                                "failed to write history after dify success for group {}: {}",
-                                group_id, e
-                            );
-                        } else {
-                            debug!(
-                                "persisted conversation_id after dify success for group {}",
-                                group_id
-                            );
-                        }
-                    }
-                }
-
-                // Split and send (optional)
-                let mut segments = Vec::new();
-                if cfg.enable_split_messages {
-                    // Regex to capture the delimiter as well
-                    // Treat newlines as explicit separators regardless of limit
-                    let answer_trimmed = answer.trim_matches(|c: char| c == '\r' || c == '\n');
-                    let mut start = 0;
-                    let max_segments = cfg.max_split_segments.max(1);
-
-                    for mat in re.find_iter(answer_trimmed) {
-                        let delimiter = mat.as_str();
-                        let is_newline = delimiter.contains('\n');
-
-                        // Check limit only for soft splits (non-newlines)
-                        if !is_newline && segments.len() >= max_segments - 1 {
-                            continue;
-                        }
-
-                        let content = &answer_trimmed[start..mat.start()];
-                        let mut s = content.to_string();
-
-                        // If delimiter is not a comma and not newline, keep it attached.
-                        if !is_newline && delimiter != "，" {
-                            s.push_str(delimiter);
-                        }
-
-                        if !s.trim().is_empty() {
-                            segments.push(s);
-                        }
-                        start = mat.end();
-                    }
-
-                    // Add the remaining part as the last segment
-                    if start < answer_trimmed.len() {
-                        let s = &answer_trimmed[start..];
-                        if !s.trim().is_empty() {
-                            segments.push(s.to_string());
-                        }
-                    }
-
-                    // Fallback single segment
-                    if segments.is_empty() && !answer_trimmed.is_empty() {
-                        segments.push(answer_trimmed.to_string());
-                    }
-                } else {
-                    segments.push(answer);
-                }
-
-                let total_segments = segments.len();
-                // Lock only for the send loop to avoid interleaving between concurrent replies
-                let _reply_guard = group_lock_arc.lock().await;
-                for (i, segment) in segments.into_iter().enumerate() {
-                    let char_count = segment.chars().count();
-                    let delay_per_char = if cfg.delay_per_char < 0.0 {
-                        0.0
-                    } else {
-                        cfg.delay_per_char
-                    };
-                    let duration = if cfg.enable_split_messages {
-                        Duration::from_secs_f64(match char_count as f64 * delay_per_char {
-                            u if u > 1.5 => 1.5,
-                            u => u,
-                        })
-                    } else {
-                        Duration::from_secs(0)
-                    };
-
-                    debug!(
-                        "sending segment {}/{} len={} delay={:?}",
-                        i + 1,
-                        total_segments,
-                        char_count,
-                        duration
-                    );
-                    kovi::tokio::time::sleep(duration).await;
-
-                    let mut msg: Message = segment.into();
-                    if let Some(reply_id) = reply_msg_id
-                        && i == 0
-                    {
-                        msg = msg.add_reply(reply_id);
-                    }
-
-                    bot.send_group_msg(group_id, msg);
-                }
-                return;
-            }
-            Err(e) => {
-                warn!(
-                    "dify chat_messages failed (attempt {}/{} ) for group {}: {}",
-                    attempt, attempts, group_id, e
-                );
-                last_err = Some(e.to_string());
-                kovi::tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-
-    // 全部失败：回填消息，避免丢失
-    error!(
-        "dify: all attempts failed for group {}: {:?}",
-        group_id, last_err
-    );
-    let mut list2 = group_list_arc.lock().await;
-    list2.messages.extend(msgs_snapshot.into_iter());
-    let history_path = data_path.join(format!("{}.json", group_id));
-    if let Ok(buf) = serde_json::to_vec_pretty(&*list2) {
-        if let Err(e) = fs::write(&history_path, buf).await {
-            warn!(
-                "failed to write history after dify failure for group {}: {}",
-                group_id, e
-            );
-        } else {
-            debug!(
-                "re-queued messages after dify failure for group {}",
-                group_id
-            );
-        }
-    }
-}
-
-async fn fetch_reply_content(bot: &kovi::RuntimeBot, reply_id: i32) -> Option<(String, String)> {
-    let ret = match bot.get_msg(reply_id).await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("get_msg failed for reply {}: {:?}", reply_id, e);
-            return None;
-        }
-    };
-
-    let sender = if let Some(v) = ret.data.get("sender") {
-        v
-    } else {
-        warn!("get_msg returned no sender field for reply {}", reply_id);
-        return None;
-    };
-
-    let sender_name = if let Some(v) = sender.get("nickname") {
-        if let Some(v) = v.as_str() {
-            v.to_string()
-        } else {
-            warn!(
-                "get_msg returned non-string nickname for reply {}",
-                reply_id
-            );
-            return None;
-        }
-    } else {
-        warn!("get_msg returned no name field for reply {}", reply_id);
-        return None;
-    };
-
-    let sender_id = if let Some(v) = sender.get("user_id") {
-        if let Some(v) = v.as_i64() {
-            v
-        } else {
-            warn!(
-                "get_msg returned non-integer user_id for reply {}",
-                reply_id
-            );
-            return None;
-        }
-    } else {
-        warn!("get_msg returned no id field for reply {}", reply_id);
-        return None;
-    };
-
-    let msg_val = if let Some(v) = ret.data.get("message") {
-        v
-    } else {
-        warn!("get_msg returned no message field for reply {}", reply_id);
-        return None;
-    };
-
-    match serde_json::from_value::<Message>(msg_val.clone()) {
-        Ok(orig_msg) => Some((
-            format!("{}({})", sender_name, sender_id),
-            orig_msg.to_human_string(),
-        )),
-        Err(e) => {
-            warn!(
-                "failed to parse get_msg message for reply {}: {}",
-                reply_id, e
-            );
-            None
-        }
-    }
 }
 
 #[kovi::plugin]
@@ -1306,11 +1209,11 @@ async fn main() {
 
     let self_id = match bot.get_login_info().await {
         Ok(info) => {
-            info!("bot info: {:#?}", info);
-            info.data.get("user_id").and_then(|v| v.as_i64())
+            info!("bot info: {info:#?}");
+            info.data.get("user_id").and_then(kovi::serde_json::Value::as_i64)
         }
         Err(e) => {
-            warn!("get_login_info failed: {}", e);
+            warn!("get_login_info failed: {e}");
             None
         }
     };
