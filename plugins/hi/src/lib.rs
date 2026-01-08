@@ -10,7 +10,7 @@ use kovi::{
     Message, PluginBuilder as plugin,
     log::{debug, error, info, warn},
     serde_json,
-    tokio::sync::Mutex,
+    tokio::sync::{Mutex, Notify},
 };
 
 use base64::Engine as _;
@@ -23,12 +23,17 @@ use regex::Regex;
 pub mod config;
 pub mod my_structs;
 
+struct MentionWaiterHandle {
+    token: u64,
+    notifier: Arc<Notify>,
+}
+
 #[derive(Clone)]
 struct AppContext {
     msg_list: Arc<Mutex<HashMap<i64, Arc<Mutex<MyMsgList>>>>>,
     last_seen: Arc<Mutex<HashMap<i64, Instant>>>,
     watching: Arc<Mutex<HashSet<i64>>>,
-    mention_waiting: Arc<Mutex<HashSet<i64>>>,
+    mention_waiting: Arc<Mutex<HashMap<i64, MentionWaiterHandle>>>,
     // Per-group reply lock to prevent interleaved segmented replies when multiple triggers occur
     reply_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
     config: config::Config,
@@ -47,12 +52,25 @@ impl AppContext {
         group_list_arc: Arc<Mutex<MyMsgList>>,
         reply_msg_id: i32,
     ) {
-        {
-            let mut set = self.mention_waiting.lock().await;
-            if set.contains(&group_id) {
-                return;
-            }
-            set.insert(group_id);
+        let notifier = Arc::new(Notify::new());
+        let (token, prev_notifier) = {
+            let mut waiting = self.mention_waiting.lock().await;
+            let next_token = waiting
+                .get(&group_id)
+                .map(|handle| handle.token.wrapping_add(1))
+                .unwrap_or(1);
+            let prev = waiting.insert(
+                group_id,
+                MentionWaiterHandle {
+                    token: next_token,
+                    notifier: notifier.clone(),
+                },
+            );
+            (next_token, prev.map(|handle| handle.notifier))
+        };
+
+        if let Some(prev) = prev_notifier {
+            prev.notify_waiters();
         }
 
         let ctx = self.clone();
@@ -65,7 +83,14 @@ impl AppContext {
 
             let wait = Duration::from_secs(ctx.config.mention_wait_seconds.max(1));
             loop {
-                kovi::tokio::time::sleep(Duration::from_millis(500)).await;
+                let notified = notifier.notified();
+                let forced = kovi::tokio::time::timeout(Duration::from_millis(500), notified)
+                    .await
+                    .is_ok();
+                if forced {
+                    break;
+                }
+
                 let last_opt = {
                     let last_seen = ctx.last_seen.lock().await;
                     last_seen.get(&group_id).cloned()
@@ -74,24 +99,29 @@ impl AppContext {
                     break;
                 };
                 if last.elapsed() >= wait {
-                    // quiet enough: send reply
-                    clear_send_and_reply(
-                        &ctx.runtime_bot,
-                        ctx.reply_locks.clone(),
-                        group_list_arc.clone(),
-                        group_id,
-                        &ctx.data_path,
-                        &ctx.img_path,
-                        &ctx.config,
-                        Some(reply_msg_id),
-                    )
-                    .await;
                     break;
                 }
             }
 
-            let mut set = ctx.mention_waiting.lock().await;
-            set.remove(&group_id);
+            // quiet enough or forced: send reply once
+            clear_send_and_reply(
+                &ctx.runtime_bot,
+                ctx.reply_locks.clone(),
+                group_list_arc.clone(),
+                group_id,
+                &ctx.data_path,
+                &ctx.img_path,
+                &ctx.config,
+                Some(reply_msg_id),
+            )
+            .await;
+
+            let mut waiting = ctx.mention_waiting.lock().await;
+            if let Some(handle) = waiting.get(&group_id) {
+                if handle.token == token {
+                    waiting.remove(&group_id);
+                }
+            }
         });
     }
     // Append segments from a Kovi Message into our MyMsgList, expanding reply segments
@@ -1302,7 +1332,7 @@ async fn main() {
     let msg_list = Arc::new(Mutex::new(initial_group_map));
     let last_seen = Arc::new(Mutex::new(HashMap::new()));
     let watching = Arc::new(Mutex::new(HashSet::new()));
-    let mention_waiting = Arc::new(Mutex::new(HashSet::new()));
+    let mention_waiting = Arc::new(Mutex::new(HashMap::new()));
     let reply_locks = Arc::new(Mutex::new(HashMap::new()));
 
     let ctx = AppContext {

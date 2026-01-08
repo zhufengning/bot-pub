@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
 use kovi::bot::event::{Sender, Sex};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SenderInfo {
