@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::ffi::OsStr;
 use std::hash::Hasher;
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use kovi::{
 use base64::Engine as _;
 use chrono::{Local, TimeZone};
 use dify_client::{Client as DifyClient, Config as DifyConfig, request};
+use rand::seq::SliceRandom;
 
 use crate::my_structs::{MyMsg, MyMsgContent, MyMsgList, SenderInfo};
 use regex::Regex;
@@ -1061,6 +1063,8 @@ async fn clear_send_and_reply(
     let mut last_err: Option<String> = None;
     let re = Regex::new(r"([，。？！]|\n+)").unwrap();
     let at_re = Regex::new(r"@\((\d+)\)").unwrap();
+    let emoji_re = Regex::new(r"#\(([^)]+)\)").unwrap();
+    let emoji_categories: HashSet<String> = cfg.emoji_categories.iter().cloned().collect();
 
     for attempt in 1..=attempts {
         let mut req = request::ChatMessagesRequest {
@@ -1161,6 +1165,7 @@ async fn clear_send_and_reply(
                 let total_segments = segments.len();
                 // Lock only for the send loop to avoid interleaving between concurrent replies
                 let _reply_guard = group_lock_arc.lock().await;
+                let mut reply_pending = reply_msg_id;
                 for (i, segment) in segments.into_iter().enumerate() {
                     let char_count = segment.chars().count();
                     let delay_per_char = if cfg.delay_per_char < 0.0 {
@@ -1186,14 +1191,29 @@ async fn clear_send_and_reply(
                     );
                     kovi::tokio::time::sleep(duration).await;
 
-                    let mut msg = build_message_with_mentions(&segment, &at_re);
-                    if let Some(reply_id) = reply_msg_id
-                        && i == 0
-                    {
-                        msg = msg.add_reply(reply_id);
+                    let (cleaned, emoji_hits) =
+                        extract_emoji_markers(&segment, &emoji_re, &emoji_categories);
+                    let mut msg = build_message_with_mentions(&cleaned, &at_re);
+                    if msg.iter().next().is_some() {
+                        if let Some(reply_id) = reply_pending {
+                            msg = msg.add_reply(reply_id);
+                            reply_pending = None;
+                        }
+                        bot.send_group_msg(group_id, msg);
                     }
 
-                    bot.send_group_msg(group_id, msg);
+                    for category in emoji_hits {
+                        if let Some(file_uri) =
+                            pick_random_emoji_file_uri(&data_path.join("emoji"), &category).await
+                        {
+                            let mut img_msg = Message::default().add_image(&file_uri);
+                            if let Some(reply_id) = reply_pending {
+                                img_msg = img_msg.add_reply(reply_id);
+                                reply_pending = None;
+                            }
+                            bot.send_group_msg(group_id, img_msg);
+                        }
+                    }
                 }
                 return;
             }
@@ -1257,6 +1277,91 @@ fn build_message_with_mentions(text: &str, at_re: &Regex) -> Message {
     }
 
     msg
+}
+
+fn extract_emoji_markers(
+    text: &str,
+    emoji_re: &Regex,
+    emoji_categories: &HashSet<String>,
+) -> (String, Vec<String>) {
+    if emoji_categories.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+
+    let mut cleaned = String::with_capacity(text.len());
+    let mut hits = Vec::new();
+    let mut last = 0;
+
+    for caps in emoji_re.captures_iter(text) {
+        let Some(mat) = caps.get(0) else {
+            continue;
+        };
+        let Some(category_raw) = caps.get(1).map(|v| v.as_str()) else {
+            continue;
+        };
+
+        cleaned.push_str(&text[last..mat.start()]);
+        let category = category_raw.trim();
+        if emoji_categories.contains(category) {
+            hits.push(category.to_string());
+        } else {
+            cleaned.push_str(mat.as_str());
+        }
+        last = mat.end();
+    }
+
+    cleaned.push_str(&text[last..]);
+    (cleaned, hits)
+}
+
+async fn pick_random_emoji_file_uri(data_path: &Path, category: &str) -> Option<String> {
+    let category_dir = data_path.join(category);
+    let mut entries = match fs::read_dir(&category_dir).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(
+                "emoji dir not found or unreadable {:?}: {}",
+                category_dir, e
+            );
+            return None;
+        }
+    };
+
+    let mut files = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let file_type = match entry.file_type().await {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        if !is_image_file(&path) {
+            continue;
+        }
+        files.push(path);
+    }
+
+    let mut rng = rand::thread_rng();
+    files.choose(&mut rng).map(|p| path_to_file_uri(p))
+}
+
+fn is_image_file(path: &Path) -> bool {
+    let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    )
+}
+
+fn path_to_file_uri(path: &Path) -> String {
+    let mut path_str = path.to_string_lossy().replace('\\', "/");
+    if path_str.starts_with('/') {
+        format!("file://{}", path_str)
+    } else {
+        format!("file:///{}", path_str)
+    }
 }
 
 async fn fetch_reply_content(bot: &kovi::RuntimeBot, reply_id: i32) -> Option<(String, String)> {

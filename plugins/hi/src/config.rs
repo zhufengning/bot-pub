@@ -18,6 +18,7 @@ pub struct Config {
     pub max_split_segments: usize,
     pub delay_per_char: f64,
     pub enable_split_messages: bool,
+    pub emoji_categories: Vec<String>,
 }
 
 impl Default for Config {
@@ -36,6 +37,7 @@ impl Default for Config {
             max_split_segments: 5,
             delay_per_char: 0.2,
             enable_split_messages: true,
+            emoji_categories: Vec::new(),
         }
     }
 }
@@ -71,6 +73,7 @@ pub async fn load_config(data_path: &Path) -> Config {
         max_split_segments: Option<usize>,
         delay_per_char: Option<f64>,
         enable_split_messages: Option<bool>,
+        emoji_categories: Option<Vec<String>>,
     }
 
     match toml::from_str::<RawConfig>(&s) {
@@ -88,6 +91,7 @@ pub async fn load_config(data_path: &Path) -> Config {
             max_split_segments: raw.max_split_segments.unwrap_or(5),
             delay_per_char: raw.delay_per_char.unwrap_or(0.2),
             enable_split_messages: raw.enable_split_messages.unwrap_or(true),
+            emoji_categories: raw.emoji_categories.unwrap_or_default(),
         },
         Err(e) => {
             warn!("failed to parse config.toml: {}", e);
