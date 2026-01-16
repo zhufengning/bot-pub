@@ -1060,6 +1060,7 @@ async fn clear_send_and_reply(
     let attempts = (1 + cfg.dify_retry_times as usize).max(1);
     let mut last_err: Option<String> = None;
     let re = Regex::new(r"([，。？！]|\n+)").unwrap();
+    let at_re = Regex::new(r"@\((\d+)\)").unwrap();
 
     for attempt in 1..=attempts {
         let mut req = request::ChatMessagesRequest {
@@ -1185,7 +1186,7 @@ async fn clear_send_and_reply(
                     );
                     kovi::tokio::time::sleep(duration).await;
 
-                    let mut msg: Message = segment.into();
+                    let mut msg = build_message_with_mentions(&segment, &at_re);
                     if let Some(reply_id) = reply_msg_id
                         && i == 0
                     {
@@ -1228,6 +1229,34 @@ async fn clear_send_and_reply(
             );
         }
     }
+}
+
+fn build_message_with_mentions(text: &str, at_re: &Regex) -> Message {
+    let mut msg = Message::default();
+    let mut last = 0;
+
+    for caps in at_re.captures_iter(text) {
+        let Some(mat) = caps.get(0) else {
+            continue;
+        };
+        let Some(id) = caps.get(1).map(|v| v.as_str()) else {
+            continue;
+        };
+
+        let before = &text[last..mat.start()];
+        if !before.is_empty() {
+            msg = msg.add_text(before);
+        }
+        msg = msg.add_at(id);
+        last = mat.end();
+    }
+
+    let rest = &text[last..];
+    if !rest.is_empty() {
+        msg = msg.add_text(rest);
+    }
+
+    msg
 }
 
 async fn fetch_reply_content(bot: &kovi::RuntimeBot, reply_id: i32) -> Option<(String, String)> {
